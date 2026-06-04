@@ -759,7 +759,18 @@ static void SetupEmbeddedStyles(ScintillaEditView& v)
 struct AppliedState { LangType lang; };
 static std::map<sptr_t, AppliedState> g_applied;
 
+// Whole-document post-lex passes (function-name scan, markdown fences) fetch
+// the full text — HighlightFunctionNames even at 2 bytes/char. Cap them so a
+// pathological file doesn't turn every debounce flush into a quarter-GB
+// allocation; the lexer's own colourise still runs at any size.
+constexpr sptr_t kMaxWholeDocPassBytes = 32 * 1024 * 1024;
+
 } // namespace
+
+void ForgetDocStyle(sptr_t docHandle)
+{
+    g_applied.erase(docHandle);
+}
 
 void ApplyLanguage(ScintillaEditView& v, LangType lang)
 {
@@ -878,7 +889,7 @@ void HighlightFunctionNames(ScintillaEditView& v, LangType lang)
     v.Call(SCI_STYLESETSIZE, EMB_FUNC, 11);
 
     sptr_t len = v.Call(SCI_GETLENGTH);
-    if (len <= 0) return;
+    if (len <= 0 || len > kMaxWholeDocPassBytes) return;
 
     // One bulk fetch of interleaved (char, style) bytes — much faster than
     // SCI_GETSTYLEAT per identifier on big files.
@@ -944,7 +955,7 @@ void StyleMarkdownFences(ScintillaEditView& v)
     setEmb(EMB_FUNC,     sP.func);
 
     sptr_t len = v.Call(SCI_GETLENGTH);
-    if (len <= 0) return;
+    if (len <= 0 || len > kMaxWholeDocPassBytes) return;
     std::string buf(static_cast<size_t>(len), '\0');
     v.Call(SCI_GETTEXT, static_cast<uptr_t>(len + 1),
         reinterpret_cast<sptr_t>(buf.data()));

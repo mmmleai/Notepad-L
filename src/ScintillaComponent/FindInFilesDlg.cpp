@@ -22,9 +22,20 @@ INT_PTR HandleThemedCtlColor(UINT m, WPARAM w, LPARAM l)
     bool isEdit = (m == WM_CTLCOLOREDIT || m == WM_CTLCOLORLISTBOX);
     COLORREF bg = isEdit ? u.editorBg : u.chromeBg;
     ::SetBkColor(hdc, bg);
-    static HBRUSH brChrome = nullptr, brEditor = nullptr;
-    if (!brChrome) brChrome = ::CreateSolidBrush(u.chromeBg);
-    if (!brEditor) brEditor = ::CreateSolidBrush(u.editorBg);
+    // Color-tracked: theme switches between dark families rebuild the
+    // brushes instead of keeping the first theme's colors forever.
+    static HBRUSH   brChrome = nullptr, brEditor = nullptr;
+    static COLORREF brChromeClr = CLR_INVALID, brEditorClr = CLR_INVALID;
+    if (!brChrome || brChromeClr != u.chromeBg) {
+        if (brChrome) ::DeleteObject(brChrome);
+        brChrome = ::CreateSolidBrush(u.chromeBg);
+        brChromeClr = u.chromeBg;
+    }
+    if (!brEditor || brEditorClr != u.editorBg) {
+        if (brEditor) ::DeleteObject(brEditor);
+        brEditor = ::CreateSolidBrush(u.editorBg);
+        brEditorClr = u.editorBg;
+    }
     (void)l;
     return reinterpret_cast<INT_PTR>(isEdit ? brEditor : brChrome);
 }

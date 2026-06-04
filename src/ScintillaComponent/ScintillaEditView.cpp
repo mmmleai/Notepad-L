@@ -68,14 +68,21 @@ void ScintillaEditView::ApplyDefaultStyle()
     Call(SCI_SETUSETABS, 0);
     Call(SCI_SETINDENT, 4);
     Call(SCI_SETVIEWWS, SCWS_INVISIBLE);
-    // Allow the caret to live past EOL and inside tab gaps for rectangular
-    // selections — without this, column selects snap left to nearest real
-    // char on each line and look mis-aligned when tabs/short lines are mixed.
-    Call(SCI_SETVIRTUALSPACEOPTIONS,
-         SCVS_RECTANGULARSELECTION | SCVS_USERACCESSIBLE | SCVS_NOWRAPLINESTART);
+    // Virtual space only while a rectangular selection is active: column
+    // selects can still reach past EOL / into tab gaps so the block stays
+    // visually aligned, but a normal click or arrow move past line end snaps
+    // the caret back to the newline like a regular editor.
+    Call(SCI_SETVIRTUALSPACEOPTIONS, SCVS_RECTANGULARSELECTION);
     // Treat tab stops as exact multi-character columns (matters once docs
     // contain literal tabs — tab width is already 4 above).
     Call(SCI_SETMOUSESELECTIONRECTANGULARSWITCH, 1);
+    // Column typing: a rectangular selection is N per-line ranges, and these
+    // make typing / Backspace / Delete / paste act on every range instead of
+    // just the main caret (N++/VS Code behavior). Also enables Ctrl+click
+    // multi-caret editing.
+    Call(SCI_SETMULTIPLESELECTION, 1);
+    Call(SCI_SETADDITIONALSELECTIONTYPING, 1);
+    Call(SCI_SETMULTIPASTE, SC_MULTIPASTE_EACH);
 
     // DirectWrite gives consistent sub-pixel metrics — important so the
     // GB2312 fallback below renders with stable widths for column selects.
@@ -88,8 +95,13 @@ void ScintillaEditView::ApplyDefaultStyle()
         ::GetVersionExW(&ovi);
         if (ovi.dwMajorVersion > 6 ||
             (ovi.dwMajorVersion == 6 && ovi.dwMinorVersion >= 2)) {
-            // Win8+ — DirectWrite always available
-            Call(SCI_SETTECHNOLOGY, SC_TECHNOLOGY_DIRECTWRITERETAIN);
+            // Win8+ — DirectWrite always available. Plain DIRECTWRITE, not
+            // DIRECTWRITERETAIN: the "retain" flavor reuses the previous
+            // frame's surface and on some drivers leaves stale blank bands
+            // between lines after edits that shift text (e.g. pressing
+            // Enter), until the next full repaint. Notepad++ ships plain
+            // DirectWrite for the same reason.
+            Call(SCI_SETTECHNOLOGY, SC_TECHNOLOGY_DIRECTWRITE);
         }
         // Win7: stay with default GDI to avoid Platform Update dependency
     }
@@ -127,6 +139,10 @@ void ScintillaEditView::ApplyDefaultStyle()
     Call(SCI_SETADDITIONALSELALPHA, 96);
     Call(SCI_SETCARETFORE, 0x303030);
     Call(SCI_SETCARETWIDTH, 2);
+    // Keep the caret a vertical line at all times: unbind Insert so the user
+    // can't toggle overtype (whose caret renders as an underscore). Binary
+    // mode still enables overtype programmatically for hex-column editing.
+    Call(SCI_ASSIGNCMDKEY, SCK_INSERT, SCI_NULL);
 
     // Line numbers margin (margin 0), width grown on demand later.
     Call(SCI_SETMARGINTYPEN, 0, SC_MARGIN_NUMBER);

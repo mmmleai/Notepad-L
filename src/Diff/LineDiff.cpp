@@ -1,6 +1,8 @@
 #include "LineDiff.h"
 #include <algorithm>
 #include <cctype>
+#include <string_view>
+#include <unordered_map>
 
 namespace npp {
 
@@ -50,33 +52,77 @@ std::vector<DiffEntry> ComputeLineDiff(const std::vector<std::string>& a,
     for (int i = 0; i < n; ++i) na[i] = Normalize(a[i], opt);
     for (int j = 0; j < m; ++j) nb[j] = Normalize(b[j], opt);
 
-    // LCS DP. O(n*m) — caller should cap input size.
-    std::vector<std::vector<int>> dp(n + 1, std::vector<int>(m + 1, 0));
-    for (int i = n - 1; i >= 0; --i) {
-        for (int j = m - 1; j >= 0; --j) {
-            dp[i][j] = (na[i] == nb[j]) ? dp[i + 1][j + 1] + 1
-                                        : std::max(dp[i + 1][j], dp[i][j + 1]);
-        }
+    // Trim the common prefix/suffix first — the typical compare is "two big
+    // files with a small changed middle", which shrinks the quadratic LCS
+    // from whole-file size down to the changed region.
+    int pre = 0;
+    while (pre < n && pre < m && na[pre] == nb[pre]) ++pre;
+    int endA = n, endB = m;
+    while (endA > pre && endB > pre && na[endA - 1] == nb[endB - 1]) {
+        --endA; --endB;
     }
+    const int nn = endA - pre;   // middle (changed-region) sizes
+    const int mm = endB - pre;
 
-    // Walk back: classify into Equal/Add/Del; later collapse adjacent Del+Add into Change.
     std::vector<DiffEntry> raw;
     raw.reserve(static_cast<size_t>(n + m));
-    int i = 0, j = 0;
-    while (i < n && j < m) {
-        if (na[i] == nb[j]) {
-            raw.push_back({DiffOp::Equal, i, j});
-            ++i; ++j;
-        } else if (dp[i + 1][j] >= dp[i][j + 1]) {
-            raw.push_back({DiffOp::Del, i, -1});
-            ++i;
-        } else {
-            raw.push_back({DiffOp::Add, -1, j});
-            ++j;
+    for (int i = 0; i < pre; ++i) raw.push_back({DiffOp::Equal, i, i});
+
+    // Intern the middle lines so the DP compares ints, not strings. The
+    // string_views key into na/nb, which outlive this scope unchanged.
+    std::unordered_map<std::string_view, int> internMap;
+    internMap.reserve(static_cast<size_t>(nn + mm));
+    auto intern = [&](const std::string& s) {
+        auto [it, inserted] = internMap.try_emplace(
+            std::string_view(s), static_cast<int>(internMap.size()));
+        (void)inserted;
+        return it->second;
+    };
+    std::vector<int> ia(nn), ib(mm);
+    for (int i = 0; i < nn; ++i) ia[i] = intern(na[pre + i]);
+    for (int j = 0; j < mm; ++j) ib[j] = intern(nb[pre + j]);
+
+    // LCS DP on the trimmed middle — a flat (nn+1)×(mm+1) int table, capped
+    // so pathological inputs can't ask for gigabytes (pre-trim 20k×20k lines
+    // was a ~1.6 GB allocation). Past the cap, fall back to pairing the
+    // middle off line-by-line: the collapse below turns it into aligned
+    // Change rows, so the panes stay usable — every middle line just shows
+    // as changed.
+    constexpr size_t kMaxDpCells = 16u * 1024 * 1024;   // 64 MB of int
+    const size_t stride = static_cast<size_t>(mm) + 1;
+    const size_t cells  = (static_cast<size_t>(nn) + 1) * stride;
+    if (nn > 0 && mm > 0 && cells <= kMaxDpCells) {
+        std::vector<int> dp(cells, 0);
+        for (int i = nn - 1; i >= 0; --i) {
+            for (int j = mm - 1; j >= 0; --j) {
+                dp[i * stride + j] = (ia[i] == ib[j])
+                    ? dp[(i + 1) * stride + (j + 1)] + 1
+                    : std::max(dp[(i + 1) * stride + j],
+                               dp[i * stride + (j + 1)]);
+            }
         }
+        int i = 0, j = 0;
+        while (i < nn && j < mm) {
+            if (ia[i] == ib[j]) {
+                raw.push_back({DiffOp::Equal, pre + i, pre + j});
+                ++i; ++j;
+            } else if (dp[(i + 1) * stride + j] >= dp[i * stride + (j + 1)]) {
+                raw.push_back({DiffOp::Del, pre + i, -1});
+                ++i;
+            } else {
+                raw.push_back({DiffOp::Add, -1, pre + j});
+                ++j;
+            }
+        }
+        while (i < nn) raw.push_back({DiffOp::Del, pre + i++, -1});
+        while (j < mm) raw.push_back({DiffOp::Add, -1, pre + j++});
+    } else {
+        for (int i = 0; i < nn; ++i) raw.push_back({DiffOp::Del, pre + i, -1});
+        for (int j = 0; j < mm; ++j) raw.push_back({DiffOp::Add, -1, pre + j});
     }
-    while (i < n) raw.push_back({DiffOp::Del, i++, -1});
-    while (j < m) raw.push_back({DiffOp::Add, -1, j++});
+
+    for (int i = endA, j = endB; i < n; ++i, ++j)
+        raw.push_back({DiffOp::Equal, i, j});
 
     // Collapse runs: pair Del+Add into Change rows so left/right stay aligned.
     std::vector<DiffEntry> out;

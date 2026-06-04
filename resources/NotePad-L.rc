@@ -64,7 +64,7 @@ BEGIN
         MENUITEM SEPARATOR
         MENUITEM "Trim Trailing Spaces",      IDM_EDIT_TRIM_TRAIL
         MENUITEM SEPARATOR
-        MENUITEM "Column &Mode\tAlt+Shift+C",       IDM_EDIT_COLUMN_MODE
+        MENUITEM "Column &Mode...",                 IDM_EDIT_COLUMN_MODE
         MENUITEM "Column Editor...\tAlt+C",         IDM_EDIT_COL_EDITOR
         MENUITEM SEPARATOR
         MENUITEM "&Binary (Hex) Mode\tCtrl+Alt+B",  IDM_EDIT_BINARY_MODE
@@ -188,7 +188,6 @@ BEGIN
     VK_F7,     IDM_TOOL_COMPARE_NEXT_DIFF, VIRTKEY
     VK_F7,     IDM_TOOL_COMPARE_PREV_DIFF, VIRTKEY, SHIFT
     "C",       IDM_EDIT_COL_EDITOR,   VIRTKEY, ALT
-    "C",       IDM_EDIT_COLUMN_MODE,  VIRTKEY, ALT, SHIFT
     "B",       IDM_EDIT_BINARY_MODE,  VIRTKEY, CONTROL, ALT
     "D",       IDM_VIEW_DARKMODE,     VIRTKEY, CONTROL, ALT
 END

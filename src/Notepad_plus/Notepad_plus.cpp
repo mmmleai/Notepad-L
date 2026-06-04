@@ -13,7 +13,9 @@
 #include <commctrl.h>
 #include <commdlg.h>
 #include <shlwapi.h>
+#include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 #include <regex>
 #include <cctype>
@@ -248,10 +250,18 @@ void Notepad_plus::ActivateBuffer(BufferID id)
     V().activeId = id;
     RefreshEditorForActiveBuffer();
     // Buffer may have pending post-edit restyle work if the debounce timer
-    // on the frame didn't fire before the user switched away.
+    // on the frame didn't fire before the user switched away. Same redraw
+    // batching as FlushPendingStyle so the styling calls coalesce into one
+    // repaint.
     if (b->StyleDirty()) {
+        HWND edHwnd = V().editor.Hwnd();
+        if (edHwnd) ::SendMessageW(edHwnd, WM_SETREDRAW, FALSE, 0);
         if (b->GetLang() == LangType::Markdown) StyleMarkdownFences(V().editor);
         else                                    HighlightFunctionNames(V().editor, b->GetLang());
+        if (edHwnd) {
+            ::SendMessageW(edHwnd, WM_SETREDRAW, TRUE, 0);
+            ::InvalidateRect(edHwnd, nullptr, FALSE);
+        }
         b->SetStyleDirty(false);
     }
     RestoreViewState(id);
@@ -326,6 +336,9 @@ void Notepad_plus::RefreshEditorForActiveBuffer()
     case Buffer::Eol::Lf:   V().editor.Call(SCI_SETEOLMODE, SC_EOL_LF);   break;
     case Buffer::Eol::Cr:   V().editor.Call(SCI_SETEOLMODE, SC_EOL_CR);   break;
     }
+    // Overtype is view state, not document state: re-assert it per buffer so
+    // hex-column overwrite never leaks from a binary-mode tab into a text tab.
+    V().editor.Call(SCI_SETOVERTYPE, IsInBinaryMode(V().activeId) ? 1 : 0);
 }
 
 void Notepad_plus::SyncTabLabel(BufferID id)
@@ -360,7 +373,7 @@ BufferID Notepad_plus::DoOpen(const std::wstring& path)
     std::wstring err;
     BufferID id = BufferManager::Instance().OpenFile(path, &err);
     if (id == kInvalidBufferID) {
-        ::MessageBoxW(nullptr, err.c_str(), L"NotePad-L",
+        ::MessageBoxW(::GetParent(V().editor.Hwnd()), err.c_str(), L"NotePad-L",
             MB_OK | MB_ICONERROR);
         return id;
     }
@@ -882,26 +895,22 @@ void GatherFiles(const std::wstring& root, bool recurse,
     ::FindClose(h);
 }
 
-} // namespace
+// Heap payload handed from the Find-in-Files worker thread to the UI thread
+// via kMsgFindInFilesDone; DeliverFindInFiles takes ownership.
+struct FifResults {
+    unsigned             gen = 0;
+    std::vector<FindHit> hits;
+    std::wstring         summary;
+};
 
-void Notepad_plus::RunFindInFiles(const FindInFilesParams& p)
+// Pure worker — enumerates and scans files, fills `out`. No UI access; runs
+// on a detached thread.
+static void SearchFilesWorker(const FindInFilesParams& p, FifResults& out)
 {
-    lastFif_ = p;
-    findResults_.Clear();
-    if (!dock_.IsShown(DockSide::Bottom)) {
-        dock_.Show(DockSide::Bottom, true);
-        HWND frame = ::GetParent(V().editor.Hwnd());
-        ::SendMessageW(frame, WM_SIZE, 0, 0);
-    }
-
     std::vector<std::wstring> files;
     GatherFiles(p.dir, p.subdirs, SplitFilters(p.filters), files);
 
     std::string needle = WideToUtf8(p.what);
-    int flags = 0;
-    if (p.matchCase) flags |= 0x4;    // SCFIND_MATCHCASE
-    if (p.wholeWord) flags |= 0x2;    // SCFIND_WHOLEWORD
-    if (p.regex)     flags |= (0x00200000 | 0x00400000); // SCFIND_REGEXP | SCFIND_CXX11REGEX
 
     // Compile the regex once for the whole search — cheap for small patterns
     // but can dominate wall-clock time when the file set is large.
@@ -912,7 +921,7 @@ void Notepad_plus::RunFindInFiles(const FindInFilesParams& p)
             if (!p.matchCase) rf |= std::regex::icase;
             rex = std::regex(needle, rf);
         } catch (...) {
-            findResults_.SetSummary(L"Invalid regex");
+            out.summary = L"Invalid regex";
             return;
         }
     }
@@ -929,13 +938,14 @@ void Notepad_plus::RunFindInFiles(const FindInFilesParams& p)
 
     int totalHits = 0;
     int filesWithHits = 0;
+    int skippedLarge = 0;
     for (const auto& f : files) {
         HANDLE hf = ::CreateFileW(f.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (hf == INVALID_HANDLE_VALUE) continue;
         LARGE_INTEGER sz{};
         ::GetFileSizeEx(hf, &sz);
-        if (sz.QuadPart > (64 * 1024 * 1024)) { ::CloseHandle(hf); continue; }
+        if (sz.QuadPart > (64 * 1024 * 1024)) { ++skippedLarge; ::CloseHandle(hf); continue; }
         std::string body(static_cast<size_t>(sz.QuadPart), '\0');
         DWORD got = 0;
         ::ReadFile(hf, body.data(), static_cast<DWORD>(body.size()), &got, nullptr);
@@ -967,7 +977,7 @@ void Notepad_plus::RunFindInFiles(const FindInFilesParams& p)
                 fh.path = f;
                 fh.line = lineNo;
                 fh.text = Utf8ToWide(line);
-                findResults_.AddHit(fh);
+                out.hits.push_back(std::move(fh));
                 ++fileHits;
                 ++totalHits;
             }
@@ -978,10 +988,54 @@ void Notepad_plus::RunFindInFiles(const FindInFilesParams& p)
     }
 
     wchar_t buf[256];
-    _snwprintf_s(buf, 256, _TRUNCATE,
-        L"Search \"%ls\"  -  %d hits in %d files  (scanned %zu files)",
-        p.what.c_str(), totalHits, filesWithHits, files.size());
-    findResults_.SetSummary(buf);
+    if (skippedLarge > 0) {
+        _snwprintf_s(buf, 256, _TRUNCATE,
+            L"Search \"%ls\"  -  %d hits in %d files  (scanned %zu files, %d >64MB skipped)",
+            p.what.c_str(), totalHits, filesWithHits, files.size(), skippedLarge);
+    } else {
+        _snwprintf_s(buf, 256, _TRUNCATE,
+            L"Search \"%ls\"  -  %d hits in %d files  (scanned %zu files)",
+            p.what.c_str(), totalHits, filesWithHits, files.size());
+    }
+    out.summary = buf;
+}
+
+} // namespace
+
+void Notepad_plus::RunFindInFiles(const FindInFilesParams& p)
+{
+    lastFif_ = p;
+    findResults_.Clear();
+    if (!dock_.IsShown(DockSide::Bottom)) {
+        dock_.Show(DockSide::Bottom, true);
+        HWND frame = ::GetParent(V().editor.Hwnd());
+        ::SendMessageW(frame, WM_SIZE, 0, 0);
+    }
+    findResults_.SetSummary(L"Searching...");
+
+    // Scan on a worker thread — running it synchronously froze the UI for the
+    // whole directory walk. Results return via kMsgFindInFilesDone; the
+    // generation stamp lets a newer search supersede an in-flight older one.
+    HWND frame = ::GetParent(V().editor.Hwnd());
+    const unsigned gen = ++fifGen_;
+    FindInFilesParams params = p;
+    std::thread([params, frame, gen]() {
+        auto* res = new FifResults();
+        res->gen = gen;
+        SearchFilesWorker(params, *res);
+        if (!::PostMessageW(frame, kMsgFindInFilesDone, 0,
+                reinterpret_cast<LPARAM>(res)))
+            delete res;   // frame already destroyed (app exit mid-scan)
+    }).detach();
+}
+
+void Notepad_plus::DeliverFindInFiles(void* payload)
+{
+    std::unique_ptr<FifResults> res(static_cast<FifResults*>(payload));
+    if (!res || res->gen != fifGen_) return;   // superseded by a newer search
+    findResults_.Clear();
+    for (const FindHit& h : res->hits) findResults_.AddHit(h);
+    findResults_.SetSummary(res->summary.c_str());
 }
 
 void Notepad_plus::SetActiveView(int v)
@@ -1269,6 +1323,8 @@ bool Notepad_plus::ToggleBinaryMode()
         ed.Call(SCI_EMPTYUNDOBUFFER);
         if (!edited) ed.Call(SCI_SETSAVEPOINT);
         binarySnapshot_.erase(it);
+        // Overwrite mode was only for hex-column editing — back to insert.
+        ed.Call(SCI_SETOVERTYPE, 0);
         if (Buffer* b = BufferManager::Instance().Get(id)) {
             ApplyLanguage(ed, b->GetLang());
             b->SetDirty(edited);

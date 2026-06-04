@@ -237,10 +237,14 @@ void FolderCompareWindow::RunCompare()
     HWND target = hwnd_;
     std::wstring lr = leftRoot_, rr = rightRoot_;
     // Detach: the worker owns the result vector; the UI thread takes
-    // ownership when it receives kMsgScanDone.
-    std::thread([target, lr, rr, opt]() {
+    // ownership when it receives kMsgScanDone. If the window was closed
+    // mid-scan (alive_ false, or the post fails), the worker frees it.
+    std::thread([target, lr, rr, opt, alive = alive_]() {
         auto* result = new std::vector<FolderEntry>(ScanFolders(lr, rr, opt));
-        ::PostMessageW(target, kMsgScanDone, 0, reinterpret_cast<LPARAM>(result));
+        if (!alive->load() ||
+            !::PostMessageW(target, kMsgScanDone, 0,
+                            reinterpret_cast<LPARAM>(result)))
+            delete result;
     }).detach();
 }
 
@@ -340,6 +344,7 @@ LRESULT CALLBACK FolderCompareWindow::Proc(HWND h, UINT m, WPARAM w, LPARAM l)
         ::DestroyWindow(h);
         return 0;
     case WM_NCDESTROY:
+        self->alive_->store(false);   // tell an in-flight scan thread to bail
         if (s_active == self) s_active = nullptr;
         delete self;
         return 0;

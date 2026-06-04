@@ -1,6 +1,8 @@
 #pragma once
 #include "FolderCompareView.h"
 #include <windows.h>
+#include <atomic>
+#include <memory>
 #include <string>
 
 namespace npp {
@@ -48,6 +50,10 @@ private:
     std::wstring       leftRoot_;
     std::wstring       rightRoot_;
     bool               scanning_ = false;
+    // Shared with the detached scan thread: flipped to false on destroy so a
+    // late worker frees its result instead of posting to a dead window.
+    std::shared_ptr<std::atomic<bool>> alive_ =
+        std::make_shared<std::atomic<bool>>(true);
 
     static FolderCompareWindow* s_active;
 };

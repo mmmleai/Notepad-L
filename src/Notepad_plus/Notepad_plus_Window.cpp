@@ -220,6 +220,11 @@ namespace {
             default:
                 break;
             }
+            // Paste/cut would splice arbitrary text into the fixed-width hex
+            // table — Scintilla binds them on the keydown. Copy stays usable.
+            if ((::GetKeyState(VK_CONTROL) & 0x8000) &&
+                (w == 'V' || w == 'X'))
+                return 0;
         }
 
         if (m == WM_CHAR) {
@@ -377,8 +382,11 @@ namespace {
         ed.Call(SCI_INDICATORCLEARRANGE, 0, len);
     }
 
-    // Highlight every occurrence of `ed`'s current selection across the doc
-    // using indicator 30. No-op if selection is empty / multi-line / huge.
+    // Highlight every occurrence of `ed`'s current selection using indicator
+    // 30. Scans only the visible lines plus a margin — the previous whole-
+    // document scan made every click and shift-drag an O(doc) pass on large
+    // files. SC_UPDATE_V_SCROLL re-runs it so occurrences scrolled into view
+    // get painted. No-op if selection is empty / multi-line / huge.
     void RefreshSmartHighlight(ScintillaEditView& ed) {
         sptr_t s = ed.Call(SCI_GETSELECTIONSTART);
         sptr_t e = ed.Call(SCI_GETSELECTIONEND);
@@ -390,11 +398,11 @@ namespace {
         if (n < 1 || n > 256) { ClearSmartHighlight(ed); return; }
 
         std::string buf(static_cast<size_t>(n) + 1, '\0');
-        Sci_TextRange tr{};
-        tr.chrg.cpMin = static_cast<Sci_PositionCR>(s);
-        tr.chrg.cpMax = static_cast<Sci_PositionCR>(e);
+        Sci_TextRangeFull tr{};
+        tr.chrg.cpMin = s;
+        tr.chrg.cpMax = e;
         tr.lpstrText  = buf.data();
-        ed.Call(SCI_GETTEXTRANGE, 0, reinterpret_cast<sptr_t>(&tr));
+        ed.Call(SCI_GETTEXTRANGEFULL, 0, reinterpret_cast<sptr_t>(&tr));
         // Skip if selection contains whitespace/control chars (not an identifier).
         for (sptr_t i = 0; i < n; ++i) {
             unsigned char c = static_cast<unsigned char>(buf[i]);
@@ -412,11 +420,27 @@ namespace {
 
         sptr_t docLen = ed.Call(SCI_GETLENGTH);
         ed.Call(SCI_INDICATORCLEARRANGE, 0, docLen);
-        ed.Call(SCI_SETSEARCHFLAGS, SCFIND_MATCHCASE);
 
-        sptr_t start = 0;
-        while (start < docLen) {
-            ed.Call(SCI_SETTARGETRANGE, static_cast<uptr_t>(start), docLen);
+        // Visible range ± margin, mapped to document lines (wrap-aware).
+        constexpr sptr_t kMarginLines = 100;
+        sptr_t firstVis  = ed.Call(SCI_GETFIRSTVISIBLELINE);
+        sptr_t onScreen  = ed.Call(SCI_LINESONSCREEN);
+        sptr_t docFirst  = ed.Call(SCI_DOCLINEFROMVISIBLE,
+            static_cast<uptr_t>(firstVis));
+        sptr_t docLast   = ed.Call(SCI_DOCLINEFROMVISIBLE,
+            static_cast<uptr_t>(firstVis + onScreen));
+        sptr_t lastLine  = ed.Call(SCI_GETLINECOUNT) - 1;
+        sptr_t scanFirst = std::max<sptr_t>(0, docFirst - kMarginLines);
+        sptr_t scanLast  = std::min<sptr_t>(lastLine, docLast + kMarginLines);
+        sptr_t scanStart = ed.Call(SCI_POSITIONFROMLINE,
+            static_cast<uptr_t>(scanFirst));
+        sptr_t scanEnd   = ed.Call(SCI_GETLINEENDPOSITION,
+            static_cast<uptr_t>(scanLast));
+
+        ed.Call(SCI_SETSEARCHFLAGS, SCFIND_MATCHCASE);
+        sptr_t start = scanStart;
+        while (start < scanEnd) {
+            ed.Call(SCI_SETTARGETRANGE, static_cast<uptr_t>(start), scanEnd);
             sptr_t pos = ed.Call(SCI_SEARCHINTARGET,
                 static_cast<uptr_t>(n),
                 reinterpret_cast<sptr_t>(buf.data()));
@@ -786,10 +810,6 @@ void Notepad_plus_Window::UpdateCheckedMenus()
     // EOL group
     UINT eolCmd = IDM_EOL_CRLF + static_cast<int>(b->GetEol());
     ::CheckMenuRadioItem(bar, IDM_EOL_CRLF, IDM_EOL_CR, eolCmd, MF_BYCOMMAND);
-    // Column-mode toggle.
-    bool colMode = app_.Editor().Call(SCI_GETSELECTIONMODE) == SC_SEL_RECTANGLE;
-    ::CheckMenuItem(bar, IDM_EDIT_COLUMN_MODE,
-        MF_BYCOMMAND | (colMode ? MF_CHECKED : MF_UNCHECKED));
     // Binary (hex) mode toggle.
     ::CheckMenuItem(bar, IDM_EDIT_BINARY_MODE,
         MF_BYCOMMAND | (app_.IsInBinaryMode(b->Id()) ? MF_CHECKED : MF_UNCHECKED));
@@ -1125,7 +1145,6 @@ void DrawBookmark(IconCanvas& c) {
     // V notch.
     c.Dot(7, 13, 0); c.Dot(8, 13, 0);
     for (int y = 10; y <= 12; ++y) {
-        int span = 12 - y;
         for (int x = 5 + (12 - y); x <= 10 - (12 - y); ++x) {
             if (x >= 5 + (12 - y) && x <= 10 - (12 - y))
                 c.Dot(x, y, clr::kFill());
@@ -1366,6 +1385,12 @@ LRESULT Notepad_plus_Window::WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         }
         break;
 
+    case kMsgFindInFilesDone:
+        // Worker thread finished a Find-in-Files scan; payload ownership
+        // passes to DeliverFindInFiles.
+        app_.DeliverFindInFiles(reinterpret_cast<void*>(l));
+        return 0;
+
     case WM_ERASEBKGND: {
         const UiPalette& u = Ui();
         HDC hdc = reinterpret_cast<HDC>(w);
@@ -1486,6 +1511,17 @@ LRESULT Notepad_plus_Window::WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             }
         }
         if (editorView >= 0) {
+            // Ignore notifications generated while a foreign document is
+            // temporarily attached (BufferManager load/save via the factory
+            // view). Attributing those savepoint/modify events to the active
+            // buffer silently cleared its dirty flag — and a clean-looking
+            // dirty buffer closes without a save prompt.
+            if (Buffer* ab = BufferManager::Instance().Get(
+                    app_.V(editorView).activeId)) {
+                if (app_.V(editorView).editor.Call(SCI_GETDOCPOINTER) !=
+                        ab->DocHandle())
+                    return 0;
+            }
             auto* scn = reinterpret_cast<SCNotification*>(l);
             switch (scn->nmhdr.code) {
             case SCN_SAVEPOINTREACHED:
@@ -1527,10 +1563,13 @@ LRESULT Notepad_plus_Window::WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
                     app_.Dock().Panel(DockSide::Right) == &app_.DocMapPane()) {
                     app_.RefreshDocMapViewport();
                 }
-                if (scn->updated & SC_UPDATE_SELECTION) {
+                // V_SCROLL included so viewport-scoped smart highlight covers
+                // occurrences that scroll into view.
+                if (scn->updated & (SC_UPDATE_SELECTION | SC_UPDATE_V_SCROLL)) {
                     ScintillaEditView& ved = app_.V(editorView).editor;
                     if (app_.IsInBinaryMode(app_.V(editorView).activeId)) {
-                        RefreshBinaryLink(ved);
+                        if (scn->updated & SC_UPDATE_SELECTION)
+                            RefreshBinaryLink(ved);
                     } else {
                         RefreshSmartHighlight(ved);
                     }
@@ -1760,21 +1799,22 @@ LRESULT Notepad_plus_Window::WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         case IDM_EDIT_COL_EDITOR:
             ShowColumnEditorDialog();
             break;
-        case IDM_EDIT_COLUMN_MODE: {
-            // Toggle Scintilla rectangular-selection mode on the active editor.
-            // SC_SEL_STREAM (0) = normal; SC_SEL_RECTANGLE (1) = column.
-            ScintillaEditView& ed = app_.Editor();
-            sptr_t mode = ed.Call(SCI_GETSELECTIONMODE);
-            sptr_t newMode = (mode == SC_SEL_RECTANGLE) ? SC_SEL_STREAM
-                                                        : SC_SEL_RECTANGLE;
-            ed.Call(SCI_SETSELECTIONMODE, static_cast<uptr_t>(newMode));
-            // Allow plain mouse drag to make rectangular selections too.
-            ed.Call(SCI_SETMOUSESELECTIONRECTANGULARSWITCH,
-                newMode == SC_SEL_RECTANGLE ? 1 : 0);
-            UpdateCheckedMenus();
-            app_.UpdateStatusBar(statusBar_);
+        case IDM_EDIT_COLUMN_MODE:
+            // Informational, Notepad++-style. Column selection is modifier-
+            // driven (Alt), not a sticky editor mode: the old
+            // SCI_SETSELECTIONMODE toggle was silently dropped by Scintilla
+            // on Esc/click, leaving a stale menu checkmark — and its OFF
+            // branch also disabled the press-Alt-mid-drag switch.
+            ::MessageBoxW(h,
+                L"Column (rectangular) selection:\n\n"
+                L"  \x2022  Hold Alt and drag with the mouse\n"
+                L"  \x2022  Or hold Alt+Shift and use the arrow keys\n\n"
+                L"You can also press Alt during a drag to turn the\n"
+                L"current selection rectangular.\n\n"
+                L"Use Edit > Column Editor (Alt+C) to insert text or\n"
+                L"number sequences into the selected columns.",
+                L"Column Mode", MB_OK | MB_ICONINFORMATION);
             break;
-        }
         case IDM_EDIT_BINARY_MODE: {
             int vBefore = app_.ActiveView();
             app_.ToggleBinaryMode();

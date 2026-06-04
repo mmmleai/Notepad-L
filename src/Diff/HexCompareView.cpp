@@ -203,8 +203,11 @@ void HexCompareView::Paint(HDC dc)
     ::DeleteObject(bgBrush);
 
     int64_t totalRows = RowCount();
-    int rowsToDraw = std::min<int64_t>(rowsVisible_ + 1, totalRows - topRow_);
-    if (rowsToDraw < 0) rowsToDraw = 0;
+    int64_t avail = totalRows - topRow_;
+    if (avail < 0) avail = 0;
+    // Bounded by rowsVisible_+1 (screen rows), so the narrowing cast is safe.
+    const int rowsToDraw = static_cast<int>(
+        std::min<int64_t>(rowsVisible_ + 1, avail));
 
     wchar_t buf[32];
     for (int r = 0; r < rowsToDraw; ++r) {
@@ -306,7 +309,6 @@ LRESULT HexCompareView::Proc(HWND h, UINT m, WPARAM w, LPARAM l)
         case VK_END:    ScrollBy(INT64_MAX / 2); return 0;
         }
         break;
-    case VK_LBUTTON:
     case WM_LBUTTONDOWN: ::SetFocus(h); return 0;
     case WM_NCDESTROY:
         if (font_) { ::DeleteObject(font_); font_ = nullptr; }

@@ -2,6 +2,7 @@
 #include "ScintillaEditView.h"
 #include "../MISC/Common/FileIO.h"
 #include "../MISC/Common/StringUtil.h"
+#include "../Parameters/Stylers.h"
 
 #include <Scintilla.h>
 #include <ScintillaMessages.h>
@@ -10,6 +11,41 @@
 #include <algorithm>
 
 namespace npp {
+
+namespace {
+// The factory view doubles as the *visible* editor of view 0, so loading or
+// saving a non-active buffer temporarily attaches a foreign document to it.
+// This guard swaps the document in and, on scope exit, restores the previous
+// document together with its scroll/caret state (re-attaching a document
+// resets the view position). Without it, every DoOpen clobbered the previous
+// tab's remembered position and DoSaveAll left the wrong document on screen.
+struct DocSwapGuard {
+    ScintillaEditView* v = nullptr;
+    sptr_t prevDoc = 0;
+    sptr_t firstVisible = 0, caret = 0, anchor = 0, xOffset = 0;
+    bool   swapped = false;
+
+    DocSwapGuard(ScintillaEditView& view, sptr_t targetDoc) : v(&view) {
+        prevDoc = v->Call(SCI_GETDOCPOINTER);
+        if (prevDoc == targetDoc) return;          // already attached — no-op
+        firstVisible = v->Call(SCI_GETFIRSTVISIBLELINE);
+        caret        = v->Call(SCI_GETCURRENTPOS);
+        anchor       = v->Call(SCI_GETANCHOR);
+        xOffset      = v->Call(SCI_GETXOFFSET);
+        v->AttachDocument(targetDoc);
+        swapped = true;
+    }
+    ~DocSwapGuard() {
+        if (!swapped) return;
+        v->AttachDocument(prevDoc);
+        // Same restore order as RestoreViewState: selection first, since
+        // SCI_SETSEL scrolls the caret into view.
+        v->Call(SCI_SETSEL, static_cast<uptr_t>(anchor), caret);
+        v->Call(SCI_SETFIRSTVISIBLELINE, static_cast<uptr_t>(firstVisible));
+        v->Call(SCI_SETXOFFSET, static_cast<uptr_t>(xOffset));
+    }
+};
+} // namespace
 
 BufferManager& BufferManager::Instance()
 {
@@ -144,8 +180,9 @@ bool BufferManager::LoadIntoDoc(Buffer& b, const std::wstring& path, std::wstrin
     b.SetEncoding(enc);
     b.SetEol(eol);
 
-    // Attach the document to the factory view briefly so we can stuff bytes in.
-    factory_->AttachDocument(b.DocHandle());
+    // Attach the document to the factory view briefly so we can stuff bytes
+    // in; the guard restores the previously visible document on return.
+    DocSwapGuard swap(*factory_, b.DocHandle());
     factory_->Call(SCI_CLEARALL);
     factory_->Call(SCI_SETCODEPAGE, SC_CP_UTF8);
     switch (eol) {
@@ -197,7 +234,7 @@ BufferID BufferManager::OpenFile(const std::wstring& path, std::wstring* errorOu
 
 bool BufferManager::WriteFromDoc(Buffer& b, const std::wstring& path, std::wstring* errorOut)
 {
-    factory_->AttachDocument(b.DocHandle());
+    DocSwapGuard swap(*factory_, b.DocHandle());
     const sptr_t len = factory_->Call(SCI_GETLENGTH);
     std::string utf8(static_cast<size_t>(len), '\0');
     if (len > 0) {
@@ -297,6 +334,9 @@ void BufferManager::CloseBuffer(BufferID id)
     auto it = buffers_.find(id);
     if (it == buffers_.end()) return;
     const sptr_t doc = it->second->DocHandle();
+    // Drop styling cache first — the handle may be recycled by a future
+    // SCI_CREATEDOCUMENT and must not look "already styled".
+    ForgetDocStyle(doc);
     // Scintilla releases the document memory once refcount hits zero.
     factory_->Call(SCI_RELEASEDOCUMENT, 0, doc);
     buffers_.erase(it);

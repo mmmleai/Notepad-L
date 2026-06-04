@@ -104,7 +104,6 @@ static void AnchorTopRight(HWND dlg, HWND anchorTo)
     ::GetWindowRect(anchorTo, &er);
     ::GetWindowRect(dlg, &dr);
     const int dw = dr.right - dr.left;
-    const int dh = dr.bottom - dr.top;
     constexpr int kMargin = 8;
     int x = er.right - dw - kMargin;
     int y = er.top   + kMargin;
@@ -471,15 +470,22 @@ INT_PTR FindReplaceDlg::HandleMessage(HWND h, UINT m, WPARAM w, LPARAM l)
         COLORREF bg = (m == WM_CTLCOLOREDIT || m == WM_CTLCOLORLISTBOX)
             ? u.editorBg : u.chromeBg;
         ::SetBkColor(hdc, bg);
-        static HBRUSH brChrome = nullptr;
-        static HBRUSH brEditor = nullptr;
-        static bool   brDark   = false;
-        if (!brDark) {
+        // Track the palette colors so switching between dark themes
+        // (DarkPro <-> DeepBlue) rebuilds the brushes instead of reusing the
+        // first theme's colors forever.
+        static HBRUSH   brChrome    = nullptr;
+        static HBRUSH   brEditor    = nullptr;
+        static COLORREF brChromeClr = CLR_INVALID;
+        static COLORREF brEditorClr = CLR_INVALID;
+        if (!brChrome || brChromeClr != u.chromeBg) {
             if (brChrome) ::DeleteObject(brChrome);
-            if (brEditor) ::DeleteObject(brEditor);
             brChrome = ::CreateSolidBrush(u.chromeBg);
+            brChromeClr = u.chromeBg;
+        }
+        if (!brEditor || brEditorClr != u.editorBg) {
+            if (brEditor) ::DeleteObject(brEditor);
             brEditor = ::CreateSolidBrush(u.editorBg);
-            brDark = true;
+            brEditorClr = u.editorBg;
         }
         return reinterpret_cast<INT_PTR>(
             (m == WM_CTLCOLOREDIT || m == WM_CTLCOLORLISTBOX) ? brEditor : brChrome);

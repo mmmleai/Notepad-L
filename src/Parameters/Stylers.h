@@ -20,6 +20,12 @@ void StyleMarkdownFences(ScintillaEditView& view);
 // is recolored as a function name (VS Code-style yellow). Idempotent.
 void HighlightFunctionNames(ScintillaEditView& view, LangType lang);
 
+// Drop the cached per-document styling state for a closed document. Must be
+// called when a Scintilla document is released, otherwise a recycled doc
+// handle can be mistaken for an already-styled document (no lexer attached,
+// no highlighting) and the cache grows without bound.
+void ForgetDocStyle(sptr_t docHandle);
+
 // ---- Shared UI palette ----------------------------------------------------
 // Used by dialogs, tab bar, and chrome to keep a consistent look.
 // Chrome layered: chromeBg (menu/toolbar/tabs) > editorBg > statusBg.

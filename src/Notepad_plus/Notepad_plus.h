@@ -15,6 +15,11 @@
 
 namespace npp {
 
+// Posted to the frame window by the Find-in-Files worker thread when a scan
+// completes. lParam carries a heap-allocated payload; the WndProc routes it
+// to Notepad_plus::DeliverFindInFiles, which takes ownership.
+inline constexpr UINT kMsgFindInFilesDone = WM_APP + 0x46;
+
 // M2 "application core": one Scintilla view reused across multiple Buffers,
 // driven by a DocTabView.
 class Notepad_plus
@@ -102,8 +107,11 @@ public:
     // Route WM_NOTIFY from the frame window to the right sub-panel.
     LRESULT RouteNotify(LPARAM lParam);
 
-    // Run a Find-in-Files search using `p`, populate find results panel.
+    // Start a Find-in-Files search using `p` on a worker thread; results
+    // arrive at the frame as kMsgFindInFilesDone and are applied by
+    // DeliverFindInFiles (which discards stale generations).
     void RunFindInFiles(const FindInFilesParams& p);
+    void DeliverFindInFiles(void* payload);
 
     // Refresh helpers (called on activation / after edits).
     void RefreshDocMapViewport();
@@ -131,6 +139,7 @@ private:
     DocMapPanel       docMap_;
     FolderWorkspacePanel folder_;
     FindInFilesParams lastFif_{};
+    unsigned          fifGen_ = 0;   // current Find-in-Files generation
     std::unordered_map<BufferID, std::string> binarySnapshot_;
     bool              binaryMutating_ = false;
 
