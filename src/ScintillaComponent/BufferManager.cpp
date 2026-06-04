@@ -28,6 +28,12 @@ struct DocSwapGuard {
     DocSwapGuard(ScintillaEditView& view, sptr_t targetDoc) : v(&view) {
         prevDoc = v->Call(SCI_GETDOCPOINTER);
         if (prevDoc == targetDoc) return;          // already attached — no-op
+        // Keep the outgoing document alive while it's detached: swapping it
+        // out drops the view's reference, and for the virgin start-up
+        // document the view's reference is the ONLY one — without this
+        // AddRef the swap destroys it and the restore in ~DocSwapGuard
+        // re-attaches freed memory (crash when launched with a file arg).
+        v->Call(SCI_ADDREFDOCUMENT, 0, prevDoc);
         firstVisible = v->Call(SCI_GETFIRSTVISIBLELINE);
         caret        = v->Call(SCI_GETCURRENTPOS);
         anchor       = v->Call(SCI_GETANCHOR);
@@ -37,7 +43,8 @@ struct DocSwapGuard {
     }
     ~DocSwapGuard() {
         if (!swapped) return;
-        v->AttachDocument(prevDoc);
+        v->AttachDocument(prevDoc);                 // view re-addrefs it
+        v->Call(SCI_RELEASEDOCUMENT, 0, prevDoc);   // drop our keep-alive ref
         // Same restore order as RestoreViewState: selection first, since
         // SCI_SETSEL scrolls the caret into view.
         v->Call(SCI_SETSEL, static_cast<uptr_t>(anchor), caret);
