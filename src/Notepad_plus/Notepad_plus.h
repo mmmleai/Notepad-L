@@ -20,6 +20,12 @@ namespace npp {
 // to Notepad_plus::DeliverFindInFiles, which takes ownership.
 inline constexpr UINT kMsgFindInFilesDone = WM_APP + 0x46;
 
+// Sent to the frame window after the active buffer changes through a path
+// that bypasses the frame's WM_NOTIFY/WM_COMMAND handlers (e.g. closing a
+// tab via its ✕ button / middle-click, which goes through the tab bar's
+// subclass proc). The frame refreshes title, status bar and menu checks.
+inline constexpr UINT kMsgUiRefresh = WM_APP + 0x47;
+
 // M2 "application core": one Scintilla view reused across multiple Buffers,
 // driven by a DocTabView.
 class Notepad_plus

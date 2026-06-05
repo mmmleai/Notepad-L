@@ -52,7 +52,11 @@ void Notepad_plus::InitViewSlot(int idx, HWND parent, HINSTANCE hInst)
     views_[idx].tabs.SetOnClose([this, idx](BufferID id) {
         activeView_ = idx;
         HWND owner = ::GetParent(views_[idx].editor.Hwnd());
-        DoClose(owner, id);
+        if (DoClose(owner, id)) {
+            // ✕ / middle-click close arrives via the tab bar's subclass proc,
+            // not the frame's WM_NOTIFY — refresh the title bar explicitly.
+            ::SendMessageW(owner, kMsgUiRefresh, 0, 0);
+        }
     });
     views_[idx].tabs.SetOnReorder([](BufferID, int) {});
     views_[idx].tabs.SetOnDropOut([this, idx](BufferID id, POINT screen) {
@@ -84,6 +88,8 @@ void Notepad_plus::InitViewSlot(int idx, HWND parent, HINSTANCE hInst)
         }
         activeView_ = other;
         ActivateBuffer(id);
+        ::SendMessageW(::GetParent(views_[other].editor.Hwnd()),
+            kMsgUiRefresh, 0, 0);
     });
     views_[idx].tabs.SetOnContext([this, idx](BufferID id, POINT screenPt) {
         activeView_ = idx;

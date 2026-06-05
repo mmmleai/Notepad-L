@@ -1385,6 +1385,14 @@ LRESULT Notepad_plus_Window::WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         }
         break;
 
+    case kMsgUiRefresh:
+        // Active buffer changed via a path that bypasses this WndProc
+        // (tab ✕ close, split-view tab drop) — refresh frame chrome.
+        UpdateCheckedMenus();
+        app_.UpdateTitle(h);
+        app_.UpdateStatusBar(statusBar_);
+        return 0;
+
     case kMsgFindInFilesDone:
         // Worker thread finished a Find-in-Files scan; payload ownership
         // passes to DeliverFindInFiles.
