@@ -1131,13 +1131,6 @@ void DrawReplace(IconCanvas& c) {
     c.HLine(4, 7, 6, clr::kAccent());
     c.Dot(7, 5, clr::kAccent()); c.Dot(8, 6, clr::kAccent()); c.Dot(7, 7, clr::kAccent());
 }
-void DrawFindFiles(IconCanvas& c) {
-    // Outline folder behind, then magnifier on top.
-    c.Rect(0, 7, 10, 14, clr::kInk());
-    c.Fill(1, 8, 9, 13, clr::kFill());
-    c.HLine(0, 5, 6, clr::kInk());
-    DrawFind(c);
-}
 void DrawBookmark(IconCanvas& c) {
     // Outline ribbon, accent fill.
     c.Rect(4, 1, 11, 13, clr::kInk());
@@ -1208,7 +1201,6 @@ void Notepad_plus_Window::CreateToolbar()
         { nullptr,       0,                       nullptr },
         { DrawFind,      IDM_SEARCH_FIND,         L"Find" },
         { DrawReplace,   IDM_SEARCH_REPLACE,      L"Replace" },
-        { DrawFindFiles, IDM_SEARCH_FINDFILES,    L"Find in Files" },
         { nullptr,       0,                       nullptr },
         { DrawBookmark,  IDM_SEARCH_BMK_TOGGLE,   L"Toggle Bookmark" },
         { nullptr,       0,                       nullptr },
@@ -1287,7 +1279,6 @@ void Notepad_plus_Window::RebuildToolbar()
         { nullptr,       0,                       nullptr },
         { DrawFind,      IDM_SEARCH_FIND,         L"Find" },
         { DrawReplace,   IDM_SEARCH_REPLACE,      L"Replace" },
-        { DrawFindFiles, IDM_SEARCH_FINDFILES,    L"Find in Files" },
         { nullptr,       0,                       nullptr },
         { DrawBookmark,  IDM_SEARCH_BMK_TOGGLE,   L"Toggle Bookmark" },
         { nullptr,       0,                       nullptr },
@@ -1391,12 +1382,6 @@ LRESULT Notepad_plus_Window::WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         UpdateCheckedMenus();
         app_.UpdateTitle(h);
         app_.UpdateStatusBar(statusBar_);
-        return 0;
-
-    case kMsgFindInFilesDone:
-        // Worker thread finished a Find-in-Files scan; payload ownership
-        // passes to DeliverFindInFiles.
-        app_.DeliverFindInFiles(reinterpret_cast<void*>(l));
         return 0;
 
     case WM_ERASEBKGND: {
@@ -1534,8 +1519,13 @@ LRESULT Notepad_plus_Window::WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             switch (scn->nmhdr.code) {
             case SCN_SAVEPOINTREACHED:
                 if (Buffer* b = BufferManager::Instance().Get(app_.ActiveBuffer())) {
-                    b->SetDirty(false);
-                    app_.Tabs().SetLabel(b->Id(), b->DisplayName(), false);
+                    // Reaching the savepoint of a hex dump whose buffer had
+                    // unsaved edits when binary mode was entered does NOT
+                    // mean the buffer matches disk — keep it dirty. Likewise
+                    // a pending encoding conversion keeps IsDirty() true.
+                    if (!app_.BinaryBaselineDirty(b->Id()))
+                        b->SetDirty(false);
+                    app_.Tabs().SetLabel(b->Id(), b->DisplayName(), b->IsDirty());
                 }
                 app_.UpdateTitle(h);
                 app_.UpdateStatusBar(statusBar_);
@@ -1752,11 +1742,13 @@ LRESULT Notepad_plus_Window::WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         case IDM_SEARCH_BMK_PREV:   app_.PrevBookmark();   break;
         case IDM_SEARCH_BMK_CLEAR:  app_.ClearAllBookmarks(); break;
 
-        case IDM_ENC_UTF8:        app_.ChangeEncoding(Buffer::Encoding::Utf8);       break;
-        case IDM_ENC_UTF8_BOM:    app_.ChangeEncoding(Buffer::Encoding::Utf8Bom);    break;
-        case IDM_ENC_UTF16LE_BOM: app_.ChangeEncoding(Buffer::Encoding::Utf16LeBom); break;
-        case IDM_ENC_UTF16BE_BOM: app_.ChangeEncoding(Buffer::Encoding::Utf16BeBom); break;
-        case IDM_ENC_ANSI:        app_.ChangeEncoding(Buffer::Encoding::Ansi);       break;
+        // Document bytes are always UTF-8 in-memory; the encoding choice only
+        // affects the next save, so "set" and "convert to" are one operation.
+        case IDM_ENC_UTF8:        app_.ConvertEncoding(Buffer::Encoding::Utf8);       break;
+        case IDM_ENC_UTF8_BOM:    app_.ConvertEncoding(Buffer::Encoding::Utf8Bom);    break;
+        case IDM_ENC_UTF16LE_BOM: app_.ConvertEncoding(Buffer::Encoding::Utf16LeBom); break;
+        case IDM_ENC_UTF16BE_BOM: app_.ConvertEncoding(Buffer::Encoding::Utf16BeBom); break;
+        case IDM_ENC_ANSI:        app_.ConvertEncoding(Buffer::Encoding::Ansi);       break;
         case IDM_ENC_CONVERT_UTF8:     app_.ConvertEncoding(Buffer::Encoding::Utf8);       break;
         case IDM_ENC_CONVERT_UTF8_BOM: app_.ConvertEncoding(Buffer::Encoding::Utf8Bom);    break;
         case IDM_ENC_CONVERT_UTF16LE:  app_.ConvertEncoding(Buffer::Encoding::Utf16LeBom); break;
@@ -1777,9 +1769,6 @@ LRESULT Notepad_plus_Window::WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         case IDM_VIEW_DOC_MAP:
             app_.Dock().SwapPanel(DockSide::Right, &app_.DocMapPane());
             app_.ToggleDock(DockSide::Right);
-            break;
-        case IDM_VIEW_FIND_RESULTS:
-            app_.ToggleDock(DockSide::Bottom);
             break;
         case IDM_VIEW_WORD_WRAP: {
             bool on = !Parameters::Instance().WordWrap();
@@ -1804,9 +1793,6 @@ LRESULT Notepad_plus_Window::WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         case IDM_VIEW_THEME_DEEPBLUE:
             SetTheme(static_cast<ThemeId>(LOWORD(w) - IDM_VIEW_THEME_BASE));
             break;
-        case IDM_EDIT_COL_EDITOR:
-            ShowColumnEditorDialog();
-            break;
         case IDM_EDIT_COLUMN_MODE:
             // Informational, Notepad++-style. Column selection is modifier-
             // driven (Alt), not a sticky editor mode: the old
@@ -1818,9 +1804,7 @@ LRESULT Notepad_plus_Window::WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
                 L"  \x2022  Hold Alt and drag with the mouse\n"
                 L"  \x2022  Or hold Alt+Shift and use the arrow keys\n\n"
                 L"You can also press Alt during a drag to turn the\n"
-                L"current selection rectangular.\n\n"
-                L"Use Edit > Column Editor (Alt+C) to insert text or\n"
-                L"number sequences into the selected columns.",
+                L"current selection rectangular.",
                 L"Column Mode", MB_OK | MB_ICONINFORMATION);
             break;
         case IDM_EDIT_BINARY_MODE: {
@@ -1871,17 +1855,6 @@ LRESULT Notepad_plus_Window::WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             }
             break;
         }
-        case IDM_SEARCH_FINDFILES: {
-            FindInFilesParams in{}, out{};
-            in.subdirs = true;
-            in.filters = L"*.*";
-            out = in;
-            if (ShowFindInFilesDlg(h, hInst_, in, out)) {
-                app_.RunFindInFiles(out);
-            }
-            break;
-        }
-
         default:
             if ((id >= IDM_EDIT_UNDO && id <= IDM_EDIT_OUTDENT)) {
                 app_.OnEdit(id);
@@ -1906,66 +1879,6 @@ LRESULT Notepad_plus_Window::WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
     }
     return ::DefWindowProcW(h, m, w, l);
-}
-
-namespace {
-
-struct ColEditState {
-    Notepad_plus::ColumnEditParams p{};
-    bool ok = false;
-};
-
-INT_PTR CALLBACK ColEditDlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    auto* st = reinterpret_cast<ColEditState*>(::GetWindowLongPtrW(h, GWLP_USERDATA));
-    switch (m) {
-    case WM_INITDIALOG:
-        ::SetWindowLongPtrW(h, GWLP_USERDATA, l);
-        ::CheckRadioButton(h, IDC_COL_RADIO_TEXT, IDC_COL_RADIO_NUM, IDC_COL_RADIO_TEXT);
-        ::CheckRadioButton(h, IDC_COL_BASE_DEC,  IDC_COL_BASE_BIN,  IDC_COL_BASE_DEC);
-        ::SetDlgItemTextW(h, IDC_COL_NUM_INIT, L"1");
-        ::SetDlgItemTextW(h, IDC_COL_NUM_INC,  L"1");
-        ::SetDlgItemTextW(h, IDC_COL_NUM_PAD,  L"0");
-        ::SetFocus(::GetDlgItem(h, IDC_COL_TEXT));
-        return FALSE;
-    case WM_COMMAND: {
-        WORD id = LOWORD(w);
-        if (id == IDOK) {
-            st = reinterpret_cast<ColEditState*>(::GetWindowLongPtrW(h, GWLP_USERDATA));
-            wchar_t buf[1024]{};
-            st->p.insertNumber = (::IsDlgButtonChecked(h, IDC_COL_RADIO_NUM) == BST_CHECKED);
-            ::GetDlgItemTextW(h, IDC_COL_TEXT, buf, 1024);
-            st->p.text = buf;
-            ::GetDlgItemTextW(h, IDC_COL_NUM_INIT, buf, 64);
-            st->p.initial   = ::_wtoi64(buf);
-            ::GetDlgItemTextW(h, IDC_COL_NUM_INC,  buf, 64);
-            st->p.increment = ::_wtoi64(buf);
-            ::GetDlgItemTextW(h, IDC_COL_NUM_PAD,  buf, 16);
-            st->p.padWidth  = ::_wtoi(buf);
-            if (::IsDlgButtonChecked(h, IDC_COL_BASE_HEX) == BST_CHECKED) st->p.base = 16;
-            else if (::IsDlgButtonChecked(h, IDC_COL_BASE_OCT) == BST_CHECKED) st->p.base = 8;
-            else if (::IsDlgButtonChecked(h, IDC_COL_BASE_BIN) == BST_CHECKED) st->p.base = 2;
-            else st->p.base = 10;
-            st->p.leadingZeros = (::IsDlgButtonChecked(h, IDC_COL_LEADZERO) == BST_CHECKED);
-            st->ok = true;
-            ::EndDialog(h, IDOK);
-            return TRUE;
-        }
-        if (id == IDCANCEL) { ::EndDialog(h, IDCANCEL); return TRUE; }
-        break;
-    }
-    case WM_CLOSE: ::EndDialog(h, IDCANCEL); return TRUE;
-    }
-    return FALSE;
-}
-
-}  // namespace
-
-void Notepad_plus_Window::ShowColumnEditorDialog()
-{
-    ColEditState st;
-    ::DialogBoxParamW(hInst_, MAKEINTRESOURCEW(IDD_COL_EDITOR),
-        hwnd_, ColEditDlgProc, reinterpret_cast<LPARAM>(&st));
-    if (st.ok) app_.ColumnEdit(st.p);
 }
 
 // ---- Text Compare picker ----------------------------------------------------

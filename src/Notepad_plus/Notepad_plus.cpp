@@ -15,9 +15,7 @@
 #include <shlwapi.h>
 #include <memory>
 #include <string>
-#include <thread>
 #include <vector>
-#include <regex>
 #include <cctype>
 
 namespace npp {
@@ -109,10 +107,8 @@ bool Notepad_plus::Attach(HWND parent, HINSTANCE hInst)
     folder_.Create(parent, hInst);
     funcList_.Create(parent, hInst);
     docMap_.Create(parent, hInst);
-    findResults_.Create(parent, hInst);
     dock_.Register(DockSide::Left,   &folder_);
     dock_.Register(DockSide::Right,  &funcList_);
-    dock_.Register(DockSide::Bottom, &findResults_);
     dock_.SetOnClose([this](DockSide side) {
         dock_.Show(side, false);
         HWND frame = ::GetParent(V().editor.Hwnd());
@@ -127,12 +123,6 @@ bool Notepad_plus::Attach(HWND parent, HINSTANCE hInst)
         if (first < 0) first = 0;
         V().editor.Call(SCI_SETFIRSTVISIBLELINE, static_cast<uptr_t>(first));
     };
-    findResults_.SetOnGoto([this, centerOnLine](const std::wstring& path, int line) {
-        BufferID id = DoOpen(path);
-        if (id == kInvalidBufferID) return;
-        centerOnLine(line - 1);
-        V().editor.SetFocus();
-    });
     funcList_.SetOnGoto([this, centerOnLine](int line) {
         centerOnLine(line - 1);
         V().editor.SetFocus();
@@ -320,9 +310,6 @@ LRESULT Notepad_plus::RouteNotify(LPARAM lParam)
 {
     auto* nm = reinterpret_cast<LPNMHDR>(lParam);
     if (!nm) return 0;
-    if (nm->hwndFrom == findResults_.Hwnd() ||
-        ::GetParent(nm->hwndFrom) == findResults_.Hwnd())
-        return findResults_.HandleNotify(lParam);
     if (nm->hwndFrom == funcList_.Hwnd() ||
         ::GetParent(nm->hwndFrom) == funcList_.Hwnd())
         return funcList_.HandleNotify(lParam);
@@ -404,7 +391,7 @@ bool Notepad_plus::DoOpenDialog(HWND parent)
         L"All files (*.*)\0*.*\0"
         L"Text files (*.txt)\0*.txt\0";
     ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_HIDEREADONLY |
-                OFN_ALLOWMULTISELECT;
+                OFN_ALLOWMULTISELECT | OFN_NOCHANGEDIR;
 
     if (!::GetOpenFileNameW(&ofn)) return false;
 
@@ -426,37 +413,27 @@ bool Notepad_plus::DoOpenDialog(HWND parent)
 
 namespace {
     std::string ParseHexDump(const std::string& dump);  // defined below.
+}
 
-    // RAII: if buffer `id` is in binary mode, swap editor content from the
-    // hex dump to raw bytes; restore the dump on destruction. Lets the save
-    // path write the real file contents without special-casing it.
-    struct BinaryModeSaveSwap {
-        ScintillaEditView* ed = nullptr;
-        std::string savedDump;
-        bool active = false;
-        BinaryModeSaveSwap(ScintillaEditView& e, bool binary) {
-            if (!binary) return;
-            ed = &e;
-            sptr_t len = ed->Call(SCI_GETLENGTH);
-            savedDump.assign(static_cast<size_t>(len), '\0');
-            if (len > 0) {
-                ed->Call(SCI_GETTEXT, static_cast<uptr_t>(len + 1),
-                    reinterpret_cast<sptr_t>(savedDump.data()));
-                savedDump.resize(static_cast<size_t>(len));
-            }
-            std::string raw = ParseHexDump(savedDump);
-            ed->Call(SCI_SETTEXT, 0,
-                reinterpret_cast<sptr_t>(raw.c_str()));
-            active = true;
-        }
-        ~BinaryModeSaveSwap() {
-            if (!active) return;
-            ed->Call(SCI_SETTEXT, 0,
-                reinterpret_cast<sptr_t>(savedDump.c_str()));
-            ed->Call(SCI_EMPTYUNDOBUFFER);
-            ed->Call(SCI_SETSAVEPOINT);
-        }
-    };
+// Binary-mode buffers are saved from their hex dump: parse the dump out of
+// the buffer's own document (works for background tabs too — Save All used
+// to serialize the dump text itself into the file) and write the decoded
+// bytes. The document is never modified, so the user's undo history
+// survives every save and a failed save leaves the dirty flag intact.
+bool Notepad_plus::SaveBinaryDump(BufferID id, const std::wstring* newPath,
+                                  std::wstring* err)
+{
+    auto& bm = BufferManager::Instance();
+    std::string raw = ParseHexDump(bm.GetDocText(id));
+    const bool ok = newPath ? bm.SaveBufferBytesAs(id, *newPath, raw, err)
+                            : bm.SaveBufferBytes(id, raw, err);
+    if (!ok) return false;
+    auto it = binarySnapshot_.find(id);
+    if (it != binarySnapshot_.end()) {
+        it->second.bytes    = std::move(raw);
+        it->second.wasDirty = false;
+    }
+    return true;
 }
 
 bool Notepad_plus::DoSave(HWND parent, BufferID id)
@@ -464,10 +441,11 @@ bool Notepad_plus::DoSave(HWND parent, BufferID id)
     Buffer* b = BufferManager::Instance().Get(id);
     if (!b) return false;
     if (b->IsUntitled()) return DoSaveAs(parent, id);
-    BinaryModeSaveSwap swap(V().editor,
-        IsInBinaryMode(id) && id == ActiveBuffer());
     std::wstring err;
-    if (!BufferManager::Instance().SaveBuffer(id, &err)) {
+    const bool ok = IsInBinaryMode(id)
+        ? SaveBinaryDump(id, nullptr, &err)
+        : BufferManager::Instance().SaveBuffer(id, &err);
+    if (!ok) {
         ::MessageBoxW(parent, err.c_str(), L"NotePad-L", MB_OK | MB_ICONERROR);
         return false;
     }
@@ -493,15 +471,18 @@ bool Notepad_plus::DoSaveAs(HWND parent, BufferID id)
     ofn.lpstrFilter =
         L"All files (*.*)\0*.*\0"
         L"Text files (*.txt)\0*.txt\0";
-    ofn.Flags = OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY;
+    ofn.Flags = OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY |
+                OFN_NOCHANGEDIR;
     ofn.lpstrDefExt = L"txt";
 
     if (!::GetSaveFileNameW(&ofn)) return false;
 
-    BinaryModeSaveSwap swap(V().editor,
-        IsInBinaryMode(id) && id == ActiveBuffer());
     std::wstring err;
-    if (!BufferManager::Instance().SaveBufferAs(id, buf, &err)) {
+    const std::wstring newPath = buf;
+    const bool ok = IsInBinaryMode(id)
+        ? SaveBinaryDump(id, &newPath, &err)
+        : BufferManager::Instance().SaveBufferAs(id, newPath, &err);
+    if (!ok) {
         ::MessageBoxW(parent, err.c_str(), L"NotePad-L", MB_OK | MB_ICONERROR);
         return false;
     }
@@ -528,9 +509,12 @@ bool Notepad_plus::PromptDirtySave(HWND parent, BufferID id)
     Buffer* b = BufferManager::Instance().Get(id);
     if (!b || !b->IsDirty()) return true;
 
-    // Temporarily attach so SCI state matches the buffer before the prompt.
+    // Bring the buffer on screen before the prompt — go through the tab bar
+    // so the tab selection, editor and title stay in sync even if the user
+    // cancels the close afterwards.
     if (V().activeId != id) {
-        ActivateBuffer(id);
+        V().tabs.Activate(id);
+        if (V().activeId != id) ActivateBuffer(id);  // safety net
     }
 
     std::wstring msg = L"Save changes to ";
@@ -546,25 +530,20 @@ bool Notepad_plus::PromptDirtySave(HWND parent, BufferID id)
 bool Notepad_plus::DoClose(HWND parent, BufferID id)
 {
     if (!PromptDirtySave(parent, id)) return false;
+    // Removing the selected tab activates its neighbour via the tab bar's
+    // callback (full ActivateBuffer incl. styling + view-state restore);
+    // removing a background tab leaves the current selection untouched.
     V().tabs.RemoveTab(id);
-
-    // Only release the buffer if the other view doesn't also hold it.
-    int other = 1 - activeView_;
-    bool stillReferenced = splitEnabled_ && views_[other].tabs.IndexOf(id) >= 0;
-    if (!stillReferenced) {
-        BufferManager::Instance().CloseBuffer(id);
-    }
+    if (V().activeId == id) V().activeId = kInvalidBufferID;
+    binarySnapshot_.erase(id);
+    BufferManager::Instance().CloseBuffer(id);
 
     // If that was the last tab in this view, make sure it isn't empty.
     if (V().tabs.TabCount() == 0) {
         DoNew();
-    } else {
-        V().activeId = V().tabs.ActiveBuffer();
-        Buffer* nb = BufferManager::Instance().Get(V().activeId);
-        if (nb) {
-            V().editor.AttachDocument(nb->DocHandle());
-            RestoreViewState(V().activeId);
-        }
+    } else if (V().activeId != V().tabs.ActiveBuffer()) {
+        // Safety net for paths where the tab callback didn't run.
+        ActivateBuffer(V().tabs.ActiveBuffer());
     }
     return true;
 }
@@ -648,6 +627,7 @@ void Notepad_plus::Shutdown()
     for (BufferID id : bm.AllIds())
         bm.CloseBuffer(id);
     bm.SetFactoryView(nullptr);
+    binarySnapshot_.clear();
 
     // Explicitly destroy Scintilla editor windows so their destructors
     // won't try to DestroyWindow on already-dead handles later.
@@ -657,6 +637,21 @@ void Notepad_plus::Shutdown()
 
 void Notepad_plus::OnEdit(unsigned int cmd)
 {
+    // The hex dump is a fixed-width table: structural edits (paste, line
+    // moves, sort, case, …) arriving via menu or accelerator would shred it
+    // and the shredded text would be decoded back into garbage bytes on
+    // save. Only read-only commands and undo/redo are allowed in hex mode.
+    if (IsInBinaryMode(ActiveBuffer())) {
+        switch (cmd) {
+        case IDM_EDIT_UNDO: case IDM_EDIT_REDO:
+        case IDM_EDIT_COPY: case IDM_EDIT_SELECTALL:
+            break;
+        default:
+            ::MessageBeep(MB_ICONASTERISK);
+            return;
+        }
+    }
+
     switch (cmd) {
     case IDM_EDIT_UNDO:      V().editor.Call(SCI_UNDO);      break;
     case IDM_EDIT_REDO:      V().editor.Call(SCI_REDO);      break;
@@ -708,10 +703,16 @@ void Notepad_plus::OnEdit(unsigned int cmd)
         sptr_t rangeEnd   = V().editor.Call(SCI_GETLINEENDPOSITION,
             static_cast<uptr_t>(lineE));
 
+        // Join with the document's EOL mode — a bare '\n' would silently
+        // convert the sorted range of a CRLF document to LF.
+        const int eolMode = static_cast<int>(V().editor.Call(SCI_GETEOLMODE));
+        const char* eol = (eolMode == SC_EOL_CR)   ? "\r"
+                        : (eolMode == SC_EOL_LF)   ? "\n"
+                                                   : "\r\n";
         std::string joined;
         for (size_t i = 0; i < lines.size(); ++i) {
             joined += lines[i];
-            if (i + 1 < lines.size()) joined += '\n';
+            if (i + 1 < lines.size()) joined += eol;
         }
         V().editor.Call(SCI_BEGINUNDOACTION);
         V().editor.Call(SCI_SETTARGETRANGE,
@@ -757,30 +758,17 @@ void Notepad_plus::ChangeLanguage(LangType lang)
     ApplyLanguage(V().editor, lang);
 }
 
-void Notepad_plus::ChangeEncoding(Buffer::Encoding enc)
-{
-    if (Buffer* b = BufferManager::Instance().Get(V().activeId)) {
-        b->SetEncoding(enc);
-    }
-}
-
 void Notepad_plus::ConvertEncoding(Buffer::Encoding enc)
 {
     if (Buffer* b = BufferManager::Instance().Get(V().activeId)) {
         if (b->GetEncoding() == enc) return;
         b->SetEncoding(enc);
-        // Force dirty so the user is prompted to save the converted bytes.
-        b->SetDirty(true);
-        V().editor.Call(SCI_SETSAVEPOINT);  // reset, then mark modify flag:
-        // There's no direct "mark dirty" SCI message — easiest is an empty
-        // insert+delete which keeps content identical but triggers the
-        // save-point-left notification.
-        sptr_t pos = V().editor.Call(SCI_GETCURRENTPOS);
-        V().editor.Call(SCI_BEGINUNDOACTION);
-        V().editor.Call(SCI_INSERTTEXT, static_cast<uptr_t>(pos),
-            reinterpret_cast<sptr_t>(" "));
-        V().editor.Call(SCI_DELETERANGE, static_cast<uptr_t>(pos), 1);
-        V().editor.Call(SCI_ENDUNDOACTION);
+        // Sticky dirty bit: undoing back to the savepoint must not launder
+        // the pending conversion away. Cleared by the next successful save.
+        // (The previous implementation relocated the Scintilla savepoint
+        // here, which let one Ctrl+Z mark an edited buffer "Saved".)
+        b->MarkEncodingDirty();
+        SyncTabLabel(V().activeId);
     }
 }
 
@@ -854,286 +842,10 @@ void Notepad_plus::ShowReplace(HWND owner, HINSTANCE hInst)
 void Notepad_plus::FindNextRepeat() { findDlg_.FindNextAgain(&V().editor); }
 void Notepad_plus::FindPrevRepeat() { findDlg_.FindPrevAgain(&V().editor); }
 
-namespace {
-
-bool MatchesAnyFilter(const std::wstring& name, const std::vector<std::wstring>& pats)
-{
-    if (pats.empty()) return true;
-    for (const auto& p : pats) {
-        if (::PathMatchSpecW(name.c_str(), p.c_str())) return true;
-    }
-    return false;
-}
-
-std::vector<std::wstring> SplitFilters(const std::wstring& s)
-{
-    std::vector<std::wstring> out;
-    std::wstring cur;
-    for (wchar_t c : s) {
-        if (c == L';' || c == L',' || c == L' ') {
-            if (!cur.empty()) { out.push_back(cur); cur.clear(); }
-        } else cur.push_back(c);
-    }
-    if (!cur.empty()) out.push_back(cur);
-    return out;
-}
-
-void GatherFiles(const std::wstring& root, bool recurse,
-                 const std::vector<std::wstring>& filters,
-                 std::vector<std::wstring>& outFiles)
-{
-    WIN32_FIND_DATAW fd;
-    std::wstring pattern = root + L"\\*";
-    HANDLE h = ::FindFirstFileW(pattern.c_str(), &fd);
-    if (h == INVALID_HANDLE_VALUE) return;
-    do {
-        if (fd.cFileName[0] == L'.' &&
-            (fd.cFileName[1] == 0 || (fd.cFileName[1] == L'.' && fd.cFileName[2] == 0)))
-            continue;
-        std::wstring full = root + L"\\" + fd.cFileName;
-        bool isDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-        if (isDir) {
-            if (recurse) GatherFiles(full, true, filters, outFiles);
-        } else if (MatchesAnyFilter(fd.cFileName, filters)) {
-            outFiles.push_back(full);
-        }
-    } while (::FindNextFileW(h, &fd));
-    ::FindClose(h);
-}
-
-// Heap payload handed from the Find-in-Files worker thread to the UI thread
-// via kMsgFindInFilesDone; DeliverFindInFiles takes ownership.
-struct FifResults {
-    unsigned             gen = 0;
-    std::vector<FindHit> hits;
-    std::wstring         summary;
-};
-
-// Pure worker — enumerates and scans files, fills `out`. No UI access; runs
-// on a detached thread.
-static void SearchFilesWorker(const FindInFilesParams& p, FifResults& out)
-{
-    std::vector<std::wstring> files;
-    GatherFiles(p.dir, p.subdirs, SplitFilters(p.filters), files);
-
-    std::string needle = WideToUtf8(p.what);
-
-    // Compile the regex once for the whole search — cheap for small patterns
-    // but can dominate wall-clock time when the file set is large.
-    std::regex rex;
-    if (p.regex) {
-        try {
-            auto rf = std::regex::ECMAScript;
-            if (!p.matchCase) rf |= std::regex::icase;
-            rex = std::regex(needle, rf);
-        } catch (...) {
-            out.summary = L"Invalid regex";
-            return;
-        }
-    }
-    auto ciFind = [](const std::string& hay, const std::string& n) -> size_t {
-        if (n.empty()) return std::string::npos;
-        auto it = std::search(hay.begin(), hay.end(), n.begin(), n.end(),
-            [](char a, char b) {
-                return std::tolower(static_cast<unsigned char>(a)) ==
-                       std::tolower(static_cast<unsigned char>(b));
-            });
-        return it == hay.end() ? std::string::npos
-                               : static_cast<size_t>(it - hay.begin());
-    };
-
-    int totalHits = 0;
-    int filesWithHits = 0;
-    int skippedLarge = 0;
-    for (const auto& f : files) {
-        HANDLE hf = ::CreateFileW(f.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (hf == INVALID_HANDLE_VALUE) continue;
-        LARGE_INTEGER sz{};
-        ::GetFileSizeEx(hf, &sz);
-        if (sz.QuadPart > (64 * 1024 * 1024)) { ++skippedLarge; ::CloseHandle(hf); continue; }
-        std::string body(static_cast<size_t>(sz.QuadPart), '\0');
-        DWORD got = 0;
-        ::ReadFile(hf, body.data(), static_cast<DWORD>(body.size()), &got, nullptr);
-        ::CloseHandle(hf);
-        body.resize(got);
-
-        // Simple scan: split body by lines then substring/regex match per line.
-        int fileHits = 0;
-        int lineNo = 0;
-        size_t pos = 0;
-        while (pos <= body.size()) {
-            size_t nl = body.find('\n', pos);
-            size_t end = (nl == std::string::npos) ? body.size() : nl;
-            ++lineNo;
-            std::string line = body.substr(pos, end - pos);
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-
-            bool hit = false;
-            if (p.regex) {
-                hit = std::regex_search(line, rex);
-            } else {
-                if (p.matchCase)
-                    hit = line.find(needle) != std::string::npos;
-                else
-                    hit = ciFind(line, needle) != std::string::npos;
-            }
-            if (hit) {
-                FindHit fh;
-                fh.path = f;
-                fh.line = lineNo;
-                fh.text = Utf8ToWide(line);
-                out.hits.push_back(std::move(fh));
-                ++fileHits;
-                ++totalHits;
-            }
-            if (nl == std::string::npos) break;
-            pos = nl + 1;
-        }
-        if (fileHits > 0) ++filesWithHits;
-    }
-
-    wchar_t buf[256];
-    if (skippedLarge > 0) {
-        _snwprintf_s(buf, 256, _TRUNCATE,
-            L"Search \"%ls\"  -  %d hits in %d files  (scanned %zu files, %d >64MB skipped)",
-            p.what.c_str(), totalHits, filesWithHits, files.size(), skippedLarge);
-    } else {
-        _snwprintf_s(buf, 256, _TRUNCATE,
-            L"Search \"%ls\"  -  %d hits in %d files  (scanned %zu files)",
-            p.what.c_str(), totalHits, filesWithHits, files.size());
-    }
-    out.summary = buf;
-}
-
-} // namespace
-
-void Notepad_plus::RunFindInFiles(const FindInFilesParams& p)
-{
-    lastFif_ = p;
-    findResults_.Clear();
-    if (!dock_.IsShown(DockSide::Bottom)) {
-        dock_.Show(DockSide::Bottom, true);
-        HWND frame = ::GetParent(V().editor.Hwnd());
-        ::SendMessageW(frame, WM_SIZE, 0, 0);
-    }
-    findResults_.SetSummary(L"Searching...");
-
-    // Scan on a worker thread — running it synchronously froze the UI for the
-    // whole directory walk. Results return via kMsgFindInFilesDone; the
-    // generation stamp lets a newer search supersede an in-flight older one.
-    HWND frame = ::GetParent(V().editor.Hwnd());
-    const unsigned gen = ++fifGen_;
-    FindInFilesParams params = p;
-    std::thread([params, frame, gen]() {
-        auto* res = new FifResults();
-        res->gen = gen;
-        SearchFilesWorker(params, *res);
-        if (!::PostMessageW(frame, kMsgFindInFilesDone, 0,
-                reinterpret_cast<LPARAM>(res)))
-            delete res;   // frame already destroyed (app exit mid-scan)
-    }).detach();
-}
-
-void Notepad_plus::DeliverFindInFiles(void* payload)
-{
-    std::unique_ptr<FifResults> res(static_cast<FifResults*>(payload));
-    if (!res || res->gen != fifGen_) return;   // superseded by a newer search
-    findResults_.Clear();
-    for (const FindHit& h : res->hits) findResults_.AddHit(h);
-    findResults_.SetSummary(res->summary.c_str());
-}
-
 void Notepad_plus::SetActiveView(int v)
 {
     if (v != 0) return;
     activeView_ = 0;
-}
-
-namespace {
-
-std::string FormatNumber(long long value, int base, int padWidth, bool leadZero)
-{
-    bool neg = value < 0;
-    unsigned long long u = neg ? static_cast<unsigned long long>(-value)
-                               : static_cast<unsigned long long>(value);
-    std::string digits;
-    if (u == 0) digits = "0";
-    while (u) {
-        int d = static_cast<int>(u % base);
-        digits.insert(digits.begin(),
-            static_cast<char>(d < 10 ? '0' + d : 'A' + (d - 10)));
-        u /= base;
-    }
-    if (neg) digits.insert(digits.begin(), '-');
-    if (leadZero && static_cast<int>(digits.size()) < padWidth) {
-        digits.insert(digits.begin(),
-            padWidth - static_cast<int>(digits.size()), '0');
-    } else if (!leadZero && static_cast<int>(digits.size()) < padWidth) {
-        digits.insert(digits.begin(),
-            padWidth - static_cast<int>(digits.size()), ' ');
-    }
-    return digits;
-}
-
-}  // namespace
-
-void Notepad_plus::ColumnEdit(const ColumnEditParams& p)
-{
-    auto& ed = V().editor;
-    sptr_t selStart = ed.Call(SCI_GETSELECTIONSTART);
-    sptr_t selEnd   = ed.Call(SCI_GETSELECTIONEND);
-    sptr_t lineA    = ed.Call(SCI_LINEFROMPOSITION, static_cast<uptr_t>(selStart));
-    sptr_t lineB    = ed.Call(SCI_LINEFROMPOSITION, static_cast<uptr_t>(selEnd));
-    sptr_t colA     = ed.Call(SCI_GETCOLUMN,        static_cast<uptr_t>(selStart));
-    sptr_t colB     = ed.Call(SCI_GETCOLUMN,        static_cast<uptr_t>(selEnd));
-    if (lineB < lineA) std::swap(lineA, lineB);
-    sptr_t col = std::min<sptr_t>(colA, colB);
-
-    // Empty selection on a single line: just use the caret column.
-    if (selStart == selEnd) {
-        col = ed.Call(SCI_GETCOLUMN, static_cast<uptr_t>(selStart));
-    }
-
-    std::string utf8Text;
-    if (!p.insertNumber) {
-        const std::wstring& w = p.text;
-        int n = ::WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1,
-            nullptr, 0, nullptr, nullptr);
-        if (n > 0) {
-            utf8Text.resize(n - 1);
-            ::WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1,
-                utf8Text.data(), n, nullptr, nullptr);
-        }
-    }
-
-    ed.Call(SCI_BEGINUNDOACTION);
-    long long val = p.initial;
-    for (sptr_t line = lineA; line <= lineB; ++line) {
-        sptr_t lineLen = ed.Call(SCI_LINELENGTH, static_cast<uptr_t>(line));
-        if (lineLen == 0 && line == ed.Call(SCI_GETLINECOUNT) - 1) {
-            // Last line, no newline — only insert if column is 0.
-        }
-        sptr_t pos = ed.Call(SCI_FINDCOLUMN,
-            static_cast<uptr_t>(line), static_cast<sptr_t>(col));
-        // Pad with spaces if line is shorter than the target column.
-        sptr_t actualCol = ed.Call(SCI_GETCOLUMN, static_cast<uptr_t>(pos));
-        std::string padded;
-        if (actualCol < col) {
-            padded.assign(static_cast<size_t>(col - actualCol), ' ');
-        }
-        std::string ins = padded;
-        if (p.insertNumber) {
-            ins += FormatNumber(val, p.base, p.padWidth, p.leadingZeros);
-            val += p.increment;
-        } else {
-            ins += utf8Text;
-        }
-        ed.Call(SCI_INSERTTEXT, static_cast<uptr_t>(pos),
-            reinterpret_cast<sptr_t>(ins.c_str()));
-    }
-    ed.Call(SCI_ENDUNDOACTION);
-    ed.SetFocus();
 }
 
 bool Notepad_plus::IsInBinaryMode(BufferID id) const
@@ -1141,53 +853,67 @@ bool Notepad_plus::IsInBinaryMode(BufferID id) const
     return binarySnapshot_.find(id) != binarySnapshot_.end();
 }
 
+bool Notepad_plus::BinaryBaselineDirty(BufferID id) const
+{
+    auto it = binarySnapshot_.find(id);
+    return it != binarySnapshot_.end() && it->second.wasDirty;
+}
+
 namespace {
+    constexpr char kHexDigits[] = "0123456789ABCDEF";
+
+    // Append a UTF-8-aware text gutter for one dump row (≤16 bytes):
+    // printable ASCII as-is, valid multi-byte UTF-8 sequences decoded so
+    // CJK characters are visible, everything else as '.'.
+    void AppendGutter(std::string& out, const char* bytes, size_t count)
+    {
+        for (size_t i = 0; i < 16 && i < count; ) {
+            unsigned char c = static_cast<unsigned char>(bytes[i]);
+            size_t seqLen = 0;
+            if (c < 0x80) { seqLen = (c >= 0x20 && c < 0x7F) ? 1 : 0; }
+            else if ((c & 0xE0) == 0xC0) seqLen = 2;
+            else if ((c & 0xF0) == 0xE0) seqLen = 3;
+            else if ((c & 0xF8) == 0xF0) seqLen = 4;
+            bool valid = seqLen > 0 && i + seqLen <= 16 && i + seqLen <= count;
+            for (size_t k = 1; valid && k < seqLen; ++k) {
+                if ((static_cast<unsigned char>(bytes[i + k]) & 0xC0) != 0x80)
+                    valid = false;
+            }
+            if (valid) { out.append(bytes + i, seqLen); i += seqLen; }
+            else       { out.push_back('.');            ++i; }
+        }
+    }
+
     // Build an `xxd`-style hex dump of `bytes`. 16 bytes per row,
-    // 8-byte gap, ASCII gutter (control bytes shown as '.').
+    // 8-byte gap, ASCII gutter. Hand-rolled nibble formatting — an
+    // snprintf per byte made toggling hex mode on big files take seconds.
     std::string MakeHexDump(const std::string& bytes)
     {
         std::string out;
         const size_t total = bytes.size();
-        out.reserve(total * 4 + total / 16 * 80);
-        char line[128];
+        out.reserve((total / 16 + 1) * 84);
+        char row[64];
         for (size_t off = 0; off < total; off += 16) {
-            int n = ::snprintf(line, sizeof(line), "%08zX  ", off);
-            out.append(line, n);
+            int n = 0;
+            for (int k = 7; k >= 0; --k)
+                row[n++] = kHexDigits[(off >> (k * 4)) & 0xF];
+            row[n++] = ' '; row[n++] = ' ';
             // Hex columns.
             for (size_t i = 0; i < 16; ++i) {
                 if (off + i < total) {
-                    n = ::snprintf(line, sizeof(line), "%02X ",
-                        static_cast<unsigned char>(bytes[off + i]));
+                    unsigned char c = static_cast<unsigned char>(bytes[off + i]);
+                    row[n++] = kHexDigits[c >> 4];
+                    row[n++] = kHexDigits[c & 0xF];
+                    row[n++] = ' ';
                 } else {
-                    n = ::snprintf(line, sizeof(line), "   ");
+                    row[n++] = ' '; row[n++] = ' '; row[n++] = ' ';
                 }
-                out.append(line, n);
-                if (i == 7) out.push_back(' ');
+                if (i == 7) row[n++] = ' ';
             }
+            out.append(row, n);
             out.append(" |");
-            // Text gutter: printable ASCII as-is; decode valid UTF-8
-            // multi-byte sequences so CJK characters are visible.
-            for (size_t i = 0; i < 16 && off + i < total; ) {
-                unsigned char c = static_cast<unsigned char>(bytes[off + i]);
-                size_t seqLen = 0;
-                if (c < 0x80) { seqLen = (c >= 0x20 && c < 0x7F) ? 1 : 0; }
-                else if ((c & 0xE0) == 0xC0) seqLen = 2;
-                else if ((c & 0xF0) == 0xE0) seqLen = 3;
-                else if ((c & 0xF8) == 0xF0) seqLen = 4;
-                bool valid = seqLen > 0 && i + seqLen <= 16 && off + i + seqLen <= total;
-                for (size_t k = 1; valid && k < seqLen; ++k) {
-                    if ((static_cast<unsigned char>(bytes[off + i + k]) & 0xC0) != 0x80) {
-                        valid = false;
-                    }
-                }
-                if (valid) {
-                    out.append(bytes, off + i, seqLen);
-                    i += seqLen;
-                } else {
-                    out.push_back('.');
-                    ++i;
-                }
-            }
+            AppendGutter(out, bytes.data() + off,
+                std::min<size_t>(16, total - off));
             out.append("|\r\n");
         }
         return out;
@@ -1323,17 +1049,21 @@ bool Notepad_plus::ToggleBinaryMode()
             dumpText.resize(static_cast<size_t>(curLen));
         }
         std::string restored = ParseHexDump(dumpText);
-        bool edited = (restored != it->second);
+        const bool edited   = (restored != it->second.bytes);
+        const bool wasDirty = it->second.wasDirty;
         ed.Call(SCI_SETTEXT, 0,
             reinterpret_cast<sptr_t>(restored.c_str()));
         ed.Call(SCI_EMPTYUNDOBUFFER);
-        if (!edited) ed.Call(SCI_SETSAVEPOINT);
+        // Savepoint = "matches disk": only when the dump wasn't edited AND
+        // the buffer was clean when hex mode was entered. Otherwise leave
+        // the document modified so the dirty flag can't be laundered away.
+        if (!edited && !wasDirty) ed.Call(SCI_SETSAVEPOINT);
         binarySnapshot_.erase(it);
         // Overwrite mode was only for hex-column editing — back to insert.
         ed.Call(SCI_SETOVERTYPE, 0);
         if (Buffer* b = BufferManager::Instance().Get(id)) {
             ApplyLanguage(ed, b->GetLang());
-            b->SetDirty(edited);
+            b->SetDirty(edited || wasDirty);
             SyncTabLabel(id);
         }
         return false;
@@ -1347,9 +1077,10 @@ bool Notepad_plus::ToggleBinaryMode()
             reinterpret_cast<sptr_t>(bytes.data()));
         bytes.resize(static_cast<size_t>(len));
     }
-    binarySnapshot_.emplace(id, bytes);
-
+    Buffer* b = BufferManager::Instance().Get(id);
+    const bool wasDirty = b && b->IsDirty();
     std::string dump = MakeHexDump(bytes);
+    binarySnapshot_.emplace(id, BinaryState{std::move(bytes), wasDirty});
     ed.Call(SCI_SETREADONLY, 0);
     ed.Call(SCI_SETTEXT, 0,
         reinterpret_cast<sptr_t>(dump.c_str()));
@@ -1363,8 +1094,10 @@ bool Notepad_plus::ToggleBinaryMode()
     // Make sure modification notifications reach our WM_NOTIFY handler so
     // the text gutter can sync on every hex-column edit.
     ed.Call(SCI_SETMODEVENTMASK, SC_MODEVENTMASKALL);
-    if (Buffer* b = BufferManager::Instance().Get(id)) {
-        b->SetDirty(false);
+    if (b) {
+        // Pre-existing unsaved edits survive the toggle; the dump itself
+        // starting at a savepoint doesn't make the buffer "saved".
+        b->SetDirty(wasDirty);
         SyncTabLabel(id);
     }
     return true;

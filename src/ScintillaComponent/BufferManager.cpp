@@ -19,6 +19,27 @@ namespace {
 // document together with its scroll/caret state (re-attaching a document
 // resets the view position). Without it, every DoOpen clobbered the previous
 // tab's remembered position and DoSaveAll left the wrong document on screen.
+// Hard cap on loadable file size. The encoding conversion paths feed sizes
+// into int-typed MultiByteToWideChar/WideCharToMultiByte parameters; without
+// a cap, a ≥2 GiB file silently loads as an EMPTY document (negative int
+// cast → conversion fails) and the next Ctrl+S destroys the on-disk file.
+constexpr ULONGLONG kMaxLoadBytes = 512ull * 1024 * 1024;
+
+// Record the file's current mtime on the buffer (stale-on-disk detection).
+// Open with full sharing so a file held by another writer doesn't fail here.
+void RecordMtime(Buffer& b, const std::wstring& path)
+{
+    HANDLE h = ::CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        FILETIME ft{};
+        ::GetFileTime(h, nullptr, nullptr, &ft);
+        b.SetLastWriteTime(ft);
+        ::CloseHandle(h);
+    }
+}
+
 struct DocSwapGuard {
     ScintillaEditView* v = nullptr;
     sptr_t prevDoc = 0;
@@ -104,6 +125,17 @@ BufferID BufferManager::NewUntitled()
 
 bool BufferManager::LoadIntoDoc(Buffer& b, const std::wstring& path, std::wstring* errorOut)
 {
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (::GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) {
+        const ULONGLONG sz =
+            (static_cast<ULONGLONG>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
+        if (sz > kMaxLoadBytes) {
+            if (errorOut)
+                *errorOut = L"File is too large to open (limit 512 MB):\n" + path;
+            return false;
+        }
+    }
+
     std::vector<char> bytes;
     if (!ReadFileAll(path, bytes)) {
         if (errorOut) *errorOut = L"Cannot open file:\n" + path;
@@ -208,15 +240,7 @@ bool BufferManager::LoadIntoDoc(Buffer& b, const std::wstring& path, std::wstrin
     factory_->Call(SCI_GOTOPOS, 0);
     b.SetDirty(false);
 
-    // Record mtime for stale-on-disk detection (M7).
-    HANDLE h = ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
-        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h != INVALID_HANDLE_VALUE) {
-        FILETIME ft{};
-        ::GetFileTime(h, nullptr, nullptr, &ft);
-        b.SetLastWriteTime(ft);
-        ::CloseHandle(h);
-    }
+    RecordMtime(b, path);
     return true;
 }
 
@@ -239,23 +263,14 @@ BufferID BufferManager::OpenFile(const std::wstring& path, std::wstring* errorOu
     return id;
 }
 
-bool BufferManager::WriteFromDoc(Buffer& b, const std::wstring& path, std::wstring* errorOut)
+bool BufferManager::EncodeAndWrite(Buffer& b, const std::wstring& path,
+                                   const std::string& utf8, std::wstring* errorOut)
 {
-    DocSwapGuard swap(*factory_, b.DocHandle());
-    const sptr_t len = factory_->Call(SCI_GETLENGTH);
-    std::string utf8(static_cast<size_t>(len), '\0');
-    if (len > 0) {
-        factory_->Call(SCI_GETTEXT,
-            static_cast<uptr_t>(len + 1),
-            reinterpret_cast<sptr_t>(utf8.data()));
-    }
-
     // Encode to target encoding + optional BOM.
     std::string out;
     switch (b.GetEncoding()) {
     case Buffer::Encoding::Utf8:
-        out = std::move(utf8);
-        break;
+        break;  // written straight from `utf8` below — no copy
     case Buffer::Encoding::Utf8Bom:
         out.reserve(utf8.size() + 3);
         out.push_back('\xEF'); out.push_back('\xBB'); out.push_back('\xBF');
@@ -301,21 +316,30 @@ bool BufferManager::WriteFromDoc(Buffer& b, const std::wstring& path, std::wstri
     }
     }
 
-    if (!WriteFileAtomic(path, out.data(), out.size())) {
+    const std::string& payload =
+        (b.GetEncoding() == Buffer::Encoding::Utf8) ? utf8 : out;
+    if (!WriteFileAtomic(path, payload.data(), payload.size())) {
         if (errorOut) *errorOut = L"Cannot write file:\n" + path;
         return false;
     }
+    RecordMtime(b, path);
+    return true;
+}
+
+bool BufferManager::WriteFromDoc(Buffer& b, const std::wstring& path, std::wstring* errorOut)
+{
+    DocSwapGuard swap(*factory_, b.DocHandle());
+    const sptr_t len = factory_->Call(SCI_GETLENGTH);
+    std::string utf8(static_cast<size_t>(len), '\0');
+    if (len > 0) {
+        factory_->Call(SCI_GETTEXT,
+            static_cast<uptr_t>(len + 1),
+            reinterpret_cast<sptr_t>(utf8.data()));
+    }
+    if (!EncodeAndWrite(b, path, utf8, errorOut)) return false;
     factory_->Call(SCI_SETSAVEPOINT);
     b.SetDirty(false);
-
-    HANDLE h = ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
-        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h != INVALID_HANDLE_VALUE) {
-        FILETIME ft{};
-        ::GetFileTime(h, nullptr, nullptr, &ft);
-        b.SetLastWriteTime(ft);
-        ::CloseHandle(h);
-    }
+    b.ClearEncodingDirty();
     return true;
 }
 
@@ -331,9 +355,72 @@ bool BufferManager::SaveBufferAs(BufferID id, const std::wstring& newPath,
 {
     Buffer* b = Get(id);
     if (!b) return false;
+    // Refuse to alias a path that's open in another tab — two buffers with
+    // the same path silently clobber each other on save.
+    BufferID existing = FindByPath(newPath);
+    if (existing != kInvalidBufferID && existing != id) {
+        if (errorOut)
+            *errorOut = L"This file is already open in another tab:\n" + newPath;
+        return false;
+    }
     if (!WriteFromDoc(*b, newPath, errorOut)) return false;
     b->SetPath(newPath);
     return true;
+}
+
+bool BufferManager::SaveBufferBytes(BufferID id, const std::string& utf8,
+                                    std::wstring* errorOut)
+{
+    Buffer* b = Get(id);
+    if (!b || b->IsUntitled() || !factory_) return false;
+    if (!EncodeAndWrite(*b, b->Path(), utf8, errorOut)) return false;
+    {
+        // Reset the savepoint so dump edits made after this save re-dirty
+        // the buffer. For the active buffer the guard is a no-op and the
+        // savepoint notification updates the dirty flag / tab star.
+        DocSwapGuard swap(*factory_, b->DocHandle());
+        factory_->Call(SCI_SETSAVEPOINT);
+    }
+    b->SetDirty(false);
+    b->ClearEncodingDirty();
+    return true;
+}
+
+bool BufferManager::SaveBufferBytesAs(BufferID id, const std::wstring& newPath,
+                                      const std::string& utf8,
+                                      std::wstring* errorOut)
+{
+    Buffer* b = Get(id);
+    if (!b || !factory_) return false;
+    BufferID existing = FindByPath(newPath);
+    if (existing != kInvalidBufferID && existing != id) {
+        if (errorOut)
+            *errorOut = L"This file is already open in another tab:\n" + newPath;
+        return false;
+    }
+    if (!EncodeAndWrite(*b, newPath, utf8, errorOut)) return false;
+    {
+        DocSwapGuard swap(*factory_, b->DocHandle());
+        factory_->Call(SCI_SETSAVEPOINT);
+    }
+    b->SetDirty(false);
+    b->ClearEncodingDirty();
+    b->SetPath(newPath);
+    return true;
+}
+
+std::string BufferManager::GetDocText(BufferID id)
+{
+    Buffer* b = Get(id);
+    if (!b || !factory_) return {};
+    DocSwapGuard swap(*factory_, b->DocHandle());
+    const sptr_t len = factory_->Call(SCI_GETLENGTH);
+    std::string text(static_cast<size_t>(len), '\0');
+    if (len > 0) {
+        factory_->Call(SCI_GETTEXT, static_cast<uptr_t>(len + 1),
+            reinterpret_cast<sptr_t>(text.data()));
+    }
+    return text;
 }
 
 void BufferManager::CloseBuffer(BufferID id)

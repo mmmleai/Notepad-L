@@ -34,6 +34,19 @@ public:
     bool SaveBufferAs(BufferID id, const std::wstring& newPath,
                       std::wstring* errorOut = nullptr);
 
+    // Save caller-provided document content (UTF-8) instead of the document's
+    // current text, without touching the document itself. Used by binary
+    // (hex) mode, where the live document holds a dump rather than the real
+    // content. Sets the savepoint / clears dirty only on success.
+    bool SaveBufferBytes(BufferID id, const std::string& utf8,
+                         std::wstring* errorOut = nullptr);
+    bool SaveBufferBytesAs(BufferID id, const std::wstring& newPath,
+                           const std::string& utf8,
+                           std::wstring* errorOut = nullptr);
+
+    // Current document text (UTF-8 bytes) of any buffer, attached or not.
+    std::string GetDocText(BufferID id);
+
     // Destroy a buffer (must be detached from all views first).
     void CloseBuffer(BufferID id);
 
@@ -53,6 +66,10 @@ private:
     bool LoadIntoDoc(Buffer& b, const std::wstring& path, std::wstring* errorOut);
     // Write the buffer's document contents to disk atomically.
     bool WriteFromDoc(Buffer& b, const std::wstring& path, std::wstring* errorOut);
+    // Encode UTF-8 document content to the buffer's on-disk encoding + BOM,
+    // then write atomically and record the new mtime.
+    bool EncodeAndWrite(Buffer& b, const std::wstring& path,
+                        const std::string& utf8, std::wstring* errorOut);
 
     ScintillaEditView* factory_ = nullptr;
     BufferID           nextId_  = 1;

@@ -31,8 +31,14 @@ public:
     // Set after a successful save.
     void SetPath(const std::wstring& newPath);
 
-    bool IsDirty() const         { return dirty_; }
+    // Dirty = unsaved edits OR a pending encoding conversion. The encoding
+    // bit is sticky across savepoint notifications (undoing back to the
+    // savepoint restores the text, not the encoding choice) and is cleared
+    // only by a successful save.
+    bool IsDirty() const         { return dirty_ || encodingDirty_; }
     void SetDirty(bool d)        { dirty_ = d; }
+    void MarkEncodingDirty()     { encodingDirty_ = true; }
+    void ClearEncodingDirty()    { encodingDirty_ = false; }
 
     FILETIME LastWriteTime() const { return lastWrite_; }
     void     SetLastWriteTime(FILETIME t) { lastWrite_ = t; }
@@ -78,6 +84,7 @@ private:
     bool            untitled_;
     int             untitledIndex_; // 1-based "new N"
     bool            dirty_ = false;
+    bool            encodingDirty_ = false;
     bool            styleDirty_ = false;
     FILETIME        lastWrite_{};
     ViewState       view_{};

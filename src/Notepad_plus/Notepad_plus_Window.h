@@ -50,7 +50,6 @@ private:
     void OpenContainingFolder(BufferID id);
     void ShowGoToLineDialog();
     void WireTabContextForView(int v);
-    void ShowColumnEditorDialog();
     void ShowTextComparePicker();
     void ShowHexComparePicker();
     // Run the debounced whole-doc restyle on the active view's dirty buffer.

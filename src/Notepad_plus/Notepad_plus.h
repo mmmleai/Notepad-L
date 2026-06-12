@@ -2,10 +2,8 @@
 #include "../ScintillaComponent/ScintillaEditView.h"
 #include "../ScintillaComponent/Buffer.h"
 #include "../ScintillaComponent/FindReplaceDlg.h"
-#include "../ScintillaComponent/FindInFilesDlg.h"
 #include "../WinControls/TabBar/DocTabView.h"
 #include "../WinControls/Docking/DockingManager.h"
-#include "../WinControls/Docking/FindResultsPanel.h"
 #include "../WinControls/Docking/FunctionListPanel.h"
 #include "../WinControls/Docking/DocMapPanel.h"
 #include "../WinControls/Docking/FolderWorkspacePanel.h"
@@ -14,11 +12,6 @@
 #include <unordered_map>
 
 namespace npp {
-
-// Posted to the frame window by the Find-in-Files worker thread when a scan
-// completes. lParam carries a heap-allocated payload; the WndProc routes it
-// to Notepad_plus::DeliverFindInFiles, which takes ownership.
-inline constexpr UINT kMsgFindInFilesDone = WM_APP + 0x46;
 
 // Sent to the frame window after the active buffer changes through a path
 // that bypasses the frame's WM_NOTIFY/WM_COMMAND handlers (e.g. closing a
@@ -65,10 +58,8 @@ public:
     void OnEdit(unsigned int cmd);
 
     // Language / encoding / EOL / bookmark / search commands.
-    void SetLanguage(Buffer::Encoding /*unused*/) {}
     void ChangeLanguage(LangType lang);
-    void ChangeEncoding(Buffer::Encoding enc);   // reinterpret (no bytes change)
-    void ConvertEncoding(Buffer::Encoding enc);  // currently same as Change + mark dirty
+    void ConvertEncoding(Buffer::Encoding enc);  // relabel save encoding + mark dirty
     void ChangeEol(Buffer::Eol eol);             // converts existing CRLF/LF/CR
 
     void ToggleBookmark();
@@ -102,7 +93,6 @@ public:
     ScintillaEditView& Editor() { return V().editor; }
     DocTabView&        Tabs()   { return V().tabs; }
     DockingManager&    Dock()   { return dock_; }
-    FindResultsPanel&  FindResults()      { return findResults_; }
     FunctionListPanel& FunctionListPane() { return funcList_; }
     DocMapPanel&       DocMapPane()       { return docMap_; }
     FolderWorkspacePanel& FolderPane()    { return folder_; }
@@ -112,12 +102,6 @@ public:
 
     // Route WM_NOTIFY from the frame window to the right sub-panel.
     LRESULT RouteNotify(LPARAM lParam);
-
-    // Start a Find-in-Files search using `p` on a worker thread; results
-    // arrive at the frame as kMsgFindInFilesDone and are applied by
-    // DeliverFindInFiles (which discards stale generations).
-    void RunFindInFiles(const FindInFilesParams& p);
-    void DeliverFindInFiles(void* payload);
 
     // Refresh helpers (called on activation / after edits).
     void RefreshDocMapViewport();
@@ -130,6 +114,12 @@ private:
     void StashViewState(BufferID id);
     void RestoreViewState(BufferID id);
 
+    // Parse the hex dump out of the buffer's document and write the decoded
+    // bytes to disk (current path, or `newPath` for Save As). Never touches
+    // the live document, so a failed save can't corrupt editor state.
+    bool SaveBinaryDump(BufferID id, const std::wstring* newPath,
+                        std::wstring* err);
+
     // Initialize one view (editor + tabs + callbacks). Called for view 0
     // during Attach() and for view 1 when the user first toggles split.
     void InitViewSlot(int idx, HWND parent, HINSTANCE hInst);
@@ -140,13 +130,18 @@ private:
 
     FindReplaceDlg    findDlg_;
     DockingManager    dock_;
-    FindResultsPanel  findResults_;
     FunctionListPanel funcList_;
     DocMapPanel       docMap_;
     FolderWorkspacePanel folder_;
-    FindInFilesParams lastFif_{};
-    unsigned          fifGen_ = 0;   // current Find-in-Files generation
-    std::unordered_map<BufferID, std::string> binarySnapshot_;
+
+    // Per-buffer binary (hex) mode state: the raw bytes backing the dump
+    // (refreshed on save) plus whether the buffer already had unsaved edits
+    // when the mode was toggled on — that dirtiness must survive the toggle.
+    struct BinaryState {
+        std::string bytes;
+        bool        wasDirty = false;
+    };
+    std::unordered_map<BufferID, BinaryState> binarySnapshot_;
     bool              binaryMutating_ = false;
 
 public:
@@ -155,22 +150,14 @@ public:
     // dump, sets the editor read-only.  OFF: restores original content.
     bool ToggleBinaryMode();
     bool IsInBinaryMode(BufferID id) const;
+    // True when the buffer had unsaved edits at the moment binary mode was
+    // toggled on. The frame's savepoint-reached handler keeps the dirty flag
+    // set in that case — reaching the dump's savepoint doesn't mean the
+    // buffer matches the file on disk.
+    bool BinaryBaselineDirty(BufferID id) const;
     // Re-render the text gutter on `line` from its current hex values.
-    // Called from SCN_MODIFIED when the user edits within binary mode.
+    // Called from SCN_UPDATEUI after the user edits within binary mode.
     void SyncBinaryGutter(ScintillaEditView& ed, sptr_t line);
-
-    // Column editor: insert text or numeric series at the same column on each
-    // line of the current selection (works with linear or rectangular sel).
-    struct ColumnEditParams {
-        bool        insertNumber = false;
-        std::wstring text;          // insertNumber=false
-        long long   initial   = 0;
-        long long   increment = 1;
-        int         padWidth  = 0;  // 0 = no padding
-        int         base      = 10; // 10/16/8/2
-        bool        leadingZeros = false;
-    };
-    void ColumnEdit(const ColumnEditParams& p);
 
     // Pretty-print the active buffer as JSON (4-space indent). Reports
     // a status message via UpdateStatusBar caller. Returns true on success.

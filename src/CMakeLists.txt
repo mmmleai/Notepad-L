@@ -9,10 +9,8 @@ set(NPP_SOURCES
     ScintillaComponent/Buffer.cpp
     ScintillaComponent/BufferManager.cpp
     ScintillaComponent/FindReplaceDlg.cpp
-    ScintillaComponent/FindInFilesDlg.cpp
     WinControls/TabBar/DocTabView.cpp
     WinControls/Docking/DockingManager.cpp
-    WinControls/Docking/FindResultsPanel.cpp
     WinControls/Docking/FunctionListPanel.cpp
     WinControls/Docking/DocMapPanel.cpp
     WinControls/Docking/FolderWorkspacePanel.cpp
@@ -38,11 +36,9 @@ set(NPP_HEADERS
     ScintillaComponent/Buffer.h
     ScintillaComponent/BufferManager.h
     ScintillaComponent/FindReplaceDlg.h
-    ScintillaComponent/FindInFilesDlg.h
     WinControls/TabBar/DocTabView.h
     WinControls/Docking/DockPanel.h
     WinControls/Docking/DockingManager.h
-    WinControls/Docking/FindResultsPanel.h
     WinControls/Docking/FunctionListPanel.h
     WinControls/Docking/DocMapPanel.h
     WinControls/Docking/FolderWorkspacePanel.h

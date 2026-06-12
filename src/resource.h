@@ -40,7 +40,6 @@
 #define IDM_EDIT_SORT_DESC          40218
 #define IDM_EDIT_INDENT             40219
 #define IDM_EDIT_OUTDENT            40220
-#define IDM_EDIT_COL_EDITOR         40221
 #define IDM_EDIT_COLUMN_MODE        40222
 #define IDM_EDIT_BINARY_MODE        40223
 #define IDM_EDIT_JSON_FORMAT        40224
@@ -92,27 +91,8 @@
 #define IDM_VIEW_FOLDER_WORKSPACE   40701
 #define IDM_VIEW_FUNCTION_LIST      40702
 #define IDM_VIEW_DOC_MAP            40703
-#define IDM_VIEW_FIND_RESULTS       40704
-
-// Search — Find in Files
-#define IDM_SEARCH_FINDFILES        40420
 #define IDM_VIEW_FOLDER_OPEN        40710   // open folder in workspace
 #define IDM_VIEW_WORD_WRAP          40720   // toggle line wrapping
-
-// Internal (not in menu): double-click hits in find-results panel
-#define IDM_INTERNAL_FINDRES_GOTO   41500
-
-// Find in Files dialog
-#define IDD_FIND_IN_FILES           200
-#define IDC_FIF_DIR                 2001
-#define IDC_FIF_BROWSE              2002
-#define IDC_FIF_FILTERS             2003
-#define IDC_FIF_WHAT                2004
-#define IDC_FIF_CASE                2005
-#define IDC_FIF_WORD                2006
-#define IDC_FIF_REGEX               2007
-#define IDC_FIF_SUBDIRS             2008
-#define IDC_FIF_FINDALL             2009
 
 // Tools — Compare
 #define IDM_TOOL_COMPARE_TEXT       40882   // Beyond-Compare-style text compare dialog
@@ -153,20 +133,6 @@
 #define IDC_TXCMP_RIGHT_BROWSE      2224
 #define IDC_TXCMP_IGNORE_WS         2225
 #define IDC_TXCMP_IGNORE_CASE       2226
-
-// Column Editor dialog
-#define IDD_COL_EDITOR              212
-#define IDC_COL_RADIO_TEXT          2120
-#define IDC_COL_RADIO_NUM           2121
-#define IDC_COL_TEXT                2122
-#define IDC_COL_NUM_INIT            2123
-#define IDC_COL_NUM_INC             2124
-#define IDC_COL_NUM_PAD             2125
-#define IDC_COL_BASE_DEC            2126
-#define IDC_COL_BASE_HEX            2127
-#define IDC_COL_BASE_OCT            2128
-#define IDC_COL_BASE_BIN            2129
-#define IDC_COL_LEADZERO            2130
 
 // Settings
 #define IDM_VIEW_DARKMODE           40800

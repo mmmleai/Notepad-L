@@ -65,7 +65,6 @@ BEGIN
         MENUITEM "Trim Trailing Spaces",      IDM_EDIT_TRIM_TRAIL
         MENUITEM SEPARATOR
         MENUITEM "Column &Mode...",                 IDM_EDIT_COLUMN_MODE
-        MENUITEM "Column Editor...\tAlt+C",         IDM_EDIT_COL_EDITOR
         MENUITEM SEPARATOR
         MENUITEM "&Binary (Hex) Mode\tCtrl+Alt+B",  IDM_EDIT_BINARY_MODE
     END
@@ -76,7 +75,6 @@ BEGIN
         MENUITEM "Find &Next\tF3",            IDM_SEARCH_FINDNEXT
         MENUITEM "Find Pre&vious\tShift+F3",  IDM_SEARCH_FINDPREV
         MENUITEM "&Go to...\tCtrl+G",         IDM_SEARCH_GOTO
-        MENUITEM "Find in Files...\tCtrl+Shift+F", IDM_SEARCH_FINDFILES
         MENUITEM SEPARATOR
         POPUP "&Bookmark"
         BEGIN
@@ -93,8 +91,6 @@ BEGIN
         MENUITEM SEPARATOR
         MENUITEM "Function &List",                 IDM_VIEW_FUNCTION_LIST
         MENUITEM "Document &Map",                  IDM_VIEW_DOC_MAP
-        MENUITEM SEPARATOR
-        MENUITEM "Find &Results",                  IDM_VIEW_FIND_RESULTS
         MENUITEM SEPARATOR
         MENUITEM "&Word Wrap",                     IDM_VIEW_WORD_WRAP
         MENUITEM SEPARATOR
@@ -173,7 +169,6 @@ BEGIN
     "U", IDM_EDIT_UPPERCASE,   VIRTKEY, CONTROL, SHIFT
     "U", IDM_EDIT_LOWERCASE,   VIRTKEY, CONTROL
     "F", IDM_SEARCH_FIND,      VIRTKEY, CONTROL
-    "F", IDM_SEARCH_FINDFILES, VIRTKEY, CONTROL, SHIFT
     "H", IDM_SEARCH_REPLACE,   VIRTKEY, CONTROL
     "G", IDM_SEARCH_GOTO,      VIRTKEY, CONTROL
     VK_F3,   IDM_SEARCH_FINDNEXT, VIRTKEY
@@ -187,7 +182,6 @@ BEGIN
     VK_PRIOR,  IDM_WIN_PREV,   VIRTKEY, CONTROL
     VK_F7,     IDM_TOOL_COMPARE_NEXT_DIFF, VIRTKEY
     VK_F7,     IDM_TOOL_COMPARE_PREV_DIFF, VIRTKEY, SHIFT
-    "C",       IDM_EDIT_COL_EDITOR,   VIRTKEY, ALT
     "B",       IDM_EDIT_BINARY_MODE,  VIRTKEY, CONTROL, ALT
     "D",       IDM_VIEW_DARKMODE,     VIRTKEY, CONTROL, ALT
 END
@@ -208,55 +202,6 @@ BEGIN
         MENUITEM "Copy Full File &Path",        IDM_TAB_COPYPATH
         MENUITEM "Open Containing &Folder",     IDM_TAB_OPENFOLDER
     END
-END
-
-IDD_FIND_IN_FILES DIALOGEX 0, 0, 288, 134
-STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "Find in Files"
-FONT 9, "Segoe UI"
-BEGIN
-    LTEXT           "Find &what:",   -1,              10,  12, 50, 9
-    EDITTEXT                         IDC_FIF_WHAT,   62,  10, 216, 13, ES_AUTOHSCROLL
-    LTEXT           "Filters:",      -1,              10,  30, 50, 9
-    EDITTEXT                         IDC_FIF_FILTERS,62,  28, 216, 13, ES_AUTOHSCROLL
-    LTEXT           "Directory:",    -1,              10,  48, 50, 9
-    EDITTEXT                         IDC_FIF_DIR,    62,  46, 196, 13, ES_AUTOHSCROLL
-    PUSHBUTTON      "...",           IDC_FIF_BROWSE,260,  46, 18, 13
-    GROUPBOX        "Options",       -1,              10,  66, 268, 42
-    AUTOCHECKBOX    "Match &case",          IDC_FIF_CASE,    18,  78, 120, 11
-    AUTOCHECKBOX    "Match &whole word",    IDC_FIF_WORD,    18,  92, 120, 11
-    AUTOCHECKBOX    "Regular e&xpression",  IDC_FIF_REGEX,  146,  78, 124, 11
-    AUTOCHECKBOX    "Include &subfolders",  IDC_FIF_SUBDIRS,146,  92, 124, 11
-    DEFPUSHBUTTON   "Find &All",     IDC_FIF_FINDALL, 168, 114, 50, 14
-    PUSHBUTTON      "Close",         IDCANCEL,        228, 114, 50, 14
-END
-
-IDD_COL_EDITOR DIALOGEX 0, 0, 280, 238
-STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "Column Editor"
-FONT 10, "Segoe UI"
-BEGIN
-    AUTORADIOBUTTON "Insert &text",        IDC_COL_RADIO_TEXT, 14, 12, 90, 12, WS_GROUP
-    EDITTEXT                               IDC_COL_TEXT,      110, 10, 156, 16, ES_AUTOHSCROLL
-
-    AUTORADIOBUTTON "Insert &number",      IDC_COL_RADIO_NUM,  14, 36, 90, 12
-
-    LTEXT    "Initial number:",       -1,                     30,  58, 82, 10
-    EDITTEXT                          IDC_COL_NUM_INIT,      118,  56, 70, 16, ES_AUTOHSCROLL
-    LTEXT    "Increase by:",          -1,                     30,  80, 82, 10
-    EDITTEXT                          IDC_COL_NUM_INC,       118,  78, 70, 16, ES_AUTOHSCROLL
-    LTEXT    "Pad with zeros (width):", -1,                   30, 102, 110, 10
-    EDITTEXT                          IDC_COL_NUM_PAD,       150, 100, 50, 16, ES_AUTOHSCROLL | ES_NUMBER
-
-    GROUPBOX "Format", -1, 14, 124, 252, 60
-    AUTORADIOBUTTON "&Dec", IDC_COL_BASE_DEC,  28, 140, 46, 12, WS_GROUP
-    AUTORADIOBUTTON "&Hex", IDC_COL_BASE_HEX,  82, 140, 46, 12
-    AUTORADIOBUTTON "&Oct", IDC_COL_BASE_OCT, 136, 140, 46, 12
-    AUTORADIOBUTTON "&Bin", IDC_COL_BASE_BIN, 190, 140, 46, 12
-    AUTOCHECKBOX    "&Leading zeros", IDC_COL_LEADZERO, 28, 162, 110, 12
-
-    DEFPUSHBUTTON   "OK",     IDOK,     130, 204, 64, 18
-    PUSHBUTTON      "Cancel", IDCANCEL, 202, 204, 64, 18
 END
 
 IDD_HEX_COMPARE DIALOGEX 0, 0, 320, 90
