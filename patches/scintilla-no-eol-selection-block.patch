@@ -1,0 +1,39 @@
+diff --git a/src/EditView.cxx b/src/EditView.cxx
+index bae7ab2..b70819e 100644
+--- a/src/EditView.cxx
++++ b/src/EditView.cxx
+@@ -1066,21 +1066,20 @@ void EditView::DrawEOL(Surface *surface, const EditModel &model, const ViewStyle
+ 	rcSegment.left = xEol + xStart + virtualSpace + blobsWidth;
+ 	rcSegment.right = rcSegment.left + vsDraw.aveCharWidth;
+ 
+-	if (eolInSelection && (line < model.pdoc->LinesTotal() - 1) && (vsDraw.selection.layer == Layer::Base)) {
+-		surface->FillRectangleAligned(rcSegment, Fill(selectionBack.Opaque()));
++	// NotePad-L: never paint the selection colour in the one-character
++	// "EOL is selected" indicator drawn past the last glyph. Stock Scintilla
++	// fills it so a multi-line selection shows a trailing segment after every
++	// line; we want the selection to stop at the last character. We still
++	// fill the area with the normal background so it repaints cleanly
++	// (FillLineRemainder paints the rest of the line out to the right edge).
++	if (background) {
++		surface->FillRectangleAligned(rcSegment, Fill(*background));
++	} else if (line < model.pdoc->LinesTotal() - 1) {
++		surface->FillRectangleAligned(rcSegment, Fill(vsDraw.styles[ll->styles[ll->numCharsInLine]].back));
++	} else if (vsDraw.styles[ll->styles[ll->numCharsInLine]].eolFilled) {
++		surface->FillRectangleAligned(rcSegment, Fill(vsDraw.styles[ll->styles[ll->numCharsInLine]].back));
+ 	} else {
+-		if (background) {
+-			surface->FillRectangleAligned(rcSegment, Fill(*background));
+-		} else if (line < model.pdoc->LinesTotal() - 1) {
+-			surface->FillRectangleAligned(rcSegment, Fill(vsDraw.styles[ll->styles[ll->numCharsInLine]].back));
+-		} else if (vsDraw.styles[ll->styles[ll->numCharsInLine]].eolFilled) {
+-			surface->FillRectangleAligned(rcSegment, Fill(vsDraw.styles[ll->styles[ll->numCharsInLine]].back));
+-		} else {
+-			surface->FillRectangleAligned(rcSegment, Fill(vsDraw.styles[StyleDefault].back));
+-		}
+-		if (eolInSelection && (line < model.pdoc->LinesTotal() - 1) && (vsDraw.selection.layer != Layer::Base)) {
+-			surface->FillRectangleAligned(rcSegment, selectionBack);
+-		}
++		surface->FillRectangleAligned(rcSegment, Fill(vsDraw.styles[StyleDefault].back));
+ 	}
+ 
+ 	rcSegment.left = rcSegment.right;
